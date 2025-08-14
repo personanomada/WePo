@@ -396,7 +396,8 @@ async def _translate_items_with_retries(
     Sends items in batches; retries missing/echoed-only items up to MAX_RETRIES.
     Progress increments only when new keys are actually filled.
     """
-    batch_size = max(10, min(100, int(batch_size or 40)))
+    # Clamp batch_size between 10 and 300 to respect safe range
+    batch_size = max(10, min(300, int(batch_size or 40)))
     remaining: Dict[str, dict] = {it["key"]: it for it in all_items}
     translated: Dict[str, str] = {}
 
@@ -428,6 +429,7 @@ async def _translate_items_with_retries(
                 if k not in remaining:
                     continue
                 src_text = remaining[k]["text"]
+                # If the translation exactly equals the source and it's *not* an allowed echo, treat as not translated
                 if v == src_text and not _allow_echo(src_text, glossary):
                     echoed += 1
                     continue
@@ -435,10 +437,12 @@ async def _translate_items_with_retries(
                 del remaining[k]
                 newly += 1
 
+            # Report progress for this batch if any items were translated or skipped as echoes
             if on_batch_progress and (newly > 0 or echoed > 0):
                 await on_batch_progress(newly, echoed)
 
     if remaining:
+        # If after retries some keys are still untranslated, raise an error
         first_missing = next(iter(remaining.keys()))
         raise HTTPException(
             status_code=400,
