@@ -561,8 +561,8 @@ async def translate_ndjson(
     if not locales_list:
         raise HTTPException(status_code=400, detail="No target locales provided")
 
+    # **FIX**: The generator is now an async generator
     async def generator():
-        # Total strings is calculated per locale, as plural forms can differ
         total_strings_per_locale = {loc: len(_build_items_for_locale(src_catalog, loc)[0]) for loc in locales_list}
         grand_total = sum(total_strings_per_locale.values())
 
@@ -572,47 +572,78 @@ async def translate_ndjson(
         overall_done = 0
         overall_echoed = 0
 
-        try:
-            for loc in locales_list:
-                all_items_for_locale, _ = _build_items_for_locale(src_catalog, loc)
+        # This queue will bridge the gap between the translation task and the streamer
+        progress_queue = asyncio.Queue()
 
-                # **FIX**: This callback is now async, allowing it to yield progress immediately.
-                async def on_progress(newly: int, echoed: int):
-                    nonlocal overall_done, overall_echoed
-                    overall_done += newly
-                    overall_echoed += echoed
-                    yield json.dumps(
-                        {"type": "progress", "done": overall_done, "total": grand_total, "echoed": overall_echoed}
-                    ) + "\n"
-                
-                translated_map = await _translate_items_with_retries(
-                    provider=provider,
-                    all_items=all_items_for_locale,
-                    source_lang=sourceLang,
-                    target_locale=loc,
-                    batch_size=s.batch_size,
-                    system_prompt=s.system_prompt,
-                    glossary=s.glossary,
-                    on_batch_progress=on_progress, # Pass the async callback
-                )
+        async def on_progress(newly: int, echoed: int):
+            await progress_queue.put((newly, echoed))
 
-                # build catalog for the current locale
-                out = _clone_catalog_structure(src_catalog)
-                out.metadata["Language"] = loc
-                out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
-                _fill_catalog_from_map(src_catalog, out, translated_map, loc)
-                produced[loc] = out
+        async def translation_task():
+            nonlocal overall_done, overall_echoed
+            try:
+                for loc in locales_list:
+                    all_items_for_locale, _ = _build_items_for_locale(src_catalog, loc)
+                    
+                    translated_map = await _translate_items_with_retries(
+                        provider=provider,
+                        all_items=all_items_for_locale,
+                        source_lang=sourceLang,
+                        target_locale=loc,
+                        batch_size=s.batch_size,
+                        system_prompt=s.system_prompt,
+                        glossary=s.glossary,
+                        on_batch_progress=on_progress,
+                    )
 
-            # All locales done -> zip and return base64
-            zip_bytes = _build_zip_bytes(produced)
-            b64 = base64.b64encode(zip_bytes).decode("ascii")
-            yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
+                    out = _clone_catalog_structure(src_catalog)
+                    out.metadata["Language"] = loc
+                    out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
+                    _fill_catalog_from_map(src_catalog, out, translated_map, loc)
+                    produced[loc] = out
 
-        except HTTPException as he:
-            yield json.dumps({"type": "error", "message": he.detail}) + "\n"
-        except Exception as e:
-            log.exception("Error during translation stream") # Log the full error
-            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+                # All locales done, signal completion
+                await progress_queue.put(None) 
+            except HTTPException as he:
+                await progress_queue.put(he)
+            except Exception as e:
+                log.exception("Error during translation task")
+                await progress_queue.put(e)
+
+        # Start the translation task in the background
+        task = asyncio.create_task(translation_task())
+
+        # Pull from the queue and yield progress to the client
+        while True:
+            item = await progress_queue.get()
+            if item is None:
+                break # Translation finished successfully
+            
+            if isinstance(item, Exception):
+                detail = item.detail if isinstance(item, HTTPException) else str(item)
+                yield json.dumps({"type": "error", "message": detail}) + "\n"
+                task.cancel()
+                return
+
+            newly, echoed = item
+            overall_done += newly
+            overall_echoed += echoed
+            yield json.dumps(
+                {"type": "progress", "done": overall_done, "total": grand_total, "echoed": overall_echoed}
+            ) + "\n"
+        
+        await task # Ensure the task is complete and handle any exceptions
+
+        if not task.done() or task.exception():
+             if task.exception():
+                  yield json.dumps({"type": "error", "message": str(task.exception())}) + "\n"
+             return
+
+
+        # Zip and return base64
+        zip_bytes = _build_zip_bytes(produced)
+        b64 = base64.b64encode(zip_bytes).decode("ascii")
+        yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
+
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
 
