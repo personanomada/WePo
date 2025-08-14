@@ -14,10 +14,25 @@ type Settings = {
   ollama: { host: string; model: string; temperature: number; };
 };
 
+// A much stricter, command-oriented default prompt.
+const DEFAULT_SYSTEM_PROMPT = `Your task is to translate text for a WordPress plugin.
+You will receive a JSON array of objects with "key" and "text" properties.
+You MUST return a single, valid JSON object and nothing else.
+Your JSON response MUST contain one key, "items", which is an array of objects. Each object must have a "key" and a "text" property containing the translation.
+Preserve all placeholders (e.g., %s, %d, <strong>, <a>) exactly.
+Do not translate terms from the glossary.
+
+EXAMPLE INPUT:
+[{"key":"msg1", "text":"Hello world"}, {"key":"msg2", "text":"Translate this!"}]
+
+EXAMPLE OUTPUT:
+{"items": [{"key": "msg1", "text": "Hallo Welt"}, {"key": "msg2", "text": "Übersetze das!"}]}`;
+
+
 export default function SettingsPanel() {
   const [s, setS] = useState<Settings>({
     provider: "openai_compat",
-    system_prompt: "",
+    system_prompt: DEFAULT_SYSTEM_PROMPT,
     glossary: "",
     batch_size: 50,
     openai_compat: { base_url: "https://api.openai.com/v1", api_key: "", model: "gpt-4o-mini", temperature: 0.2 },
@@ -34,7 +49,13 @@ export default function SettingsPanel() {
       try {
         const res = await fetch("http://localhost:8000/settings");
         const data = await res.json();
-        if (data?.defaults) setS(data.defaults);
+        if (data?.defaults) {
+          // Ensure system_prompt is not empty after loading
+          if (!data.defaults.system_prompt) {
+            data.defaults.system_prompt = DEFAULT_SYSTEM_PROMPT;
+          }
+          setS(data.defaults)
+        };
       } catch {}
     })();
   }, []);
@@ -116,7 +137,7 @@ export default function SettingsPanel() {
           </div>
           <div className="sm:col-span-2">
             <Label>System prompt</Label>
-            <Textarea value={s.system_prompt} onChange={e=>setS({...s, system_prompt: e.target.value})} rows={3} placeholder="Guidance for the model"/>
+            <Textarea value={s.system_prompt} onChange={e=>setS({...s, system_prompt: e.target.value})} rows={12} placeholder="Guidance for the model"/>
           </div>
           <div className="sm:col-span-2">
             <Label>Glossary / untranslatable terms</Label>

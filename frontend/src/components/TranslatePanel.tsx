@@ -1,15 +1,99 @@
 import { useEffect, useRef, useState } from "react";
 import { LOCALES, LocaleOption } from "../lib/locales";
-import { Button } from "../components/ui/Button"; // adjust if your Button path differs
-import { cn } from "../lib/cn"; // optional helper; remove if you don't have it
+import { Button } from "../components/ui/Button"; 
+import { cn } from "../lib/cn"; 
 
 type Props = {};
+
+/**
+ * Parses a stream of newline-delimited JSON, specifically handling the nested
+ * structure of AI chat completion responses. It extracts the actual translation
+ * content and calls the appropriate handler.
+ */
+async function streamAndParseAIResponse(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onMeta: (meta: any) => void,
+  onBatch: (batch: any) => void,
+  onDone: (done: any) => void,
+  onError: (error: any) => void,
+  signal: AbortSignal
+) {
+  const dec = new TextDecoder();
+  let buffer = "";
+
+  const read = async () => {
+    if (signal.aborted) {
+      reader.cancel();
+      return;
+    }
+    const { value, done } = await reader.read();
+    if (done) return;
+
+    buffer += dec.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.trim() === "") continue;
+      try {
+        const serverEvent = JSON.parse(line);
+
+        // Handle specific server events for progress and metadata
+        if (serverEvent.type === "meta") {
+          onMeta(serverEvent);
+          continue;
+        }
+        if (serverEvent.type === "progress") { // Keep this for potential future backend changes
+           onBatch(serverEvent.items || []);
+           continue;
+        }
+        if (serverEvent.type === "done") {
+          onDone(serverEvent);
+          continue;
+        }
+         if (serverEvent.type === "error") {
+          onError(serverEvent);
+          continue;
+        }
+
+        // --- Start of logic to handle raw AI responses ---
+        // This is the key part for parsing the nested structure from your logs.
+        let contentStr = null;
+        if (serverEvent.choices && serverEvent.choices[0]?.message?.content) {
+            contentStr = serverEvent.choices[0].message.content;
+        }
+
+        if (contentStr) {
+          try {
+            // The actual translations are a stringified JSON inside the 'content' field
+            const innerData = JSON.parse(contentStr); 
+            if (innerData.items && Array.isArray(innerData.items)) {
+              onBatch(innerData.items);
+            }
+          } catch (e) {
+            console.error("Failed to parse inner JSON from AI content:", contentStr, e);
+          }
+        }
+        // --- End of logic to handle raw AI responses ---
+
+      } catch (e) {
+        console.error("Failed to parse outer NDJSON line:", line, e);
+      }
+    }
+    
+    await read();
+  };
+  
+  await read();
+}
+
 
 export default function TranslatePanel({}: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [sourceLang, setSourceLang] = useState("en");
   const [selectedLocales, setSelectedLocales] = useState<LocaleOption[]>([]);
   const [progress, setProgress] = useState({ done: 0, total: 0, echoed: 0 });
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isTranslating, setIsTranslating] = useState(false);
 
@@ -41,7 +125,8 @@ export default function TranslatePanel({}: Props) {
 
     setIsTranslating(true);
     setError(null);
-    setProgress({ done: 0, total: 0, echoed: 0 });
+    setStatus("Initializing translation...");
+    setProgress({ done: 0, total: 1, echoed: 0 }); // Set total to 1 to show indeterminate progress initially
 
     const form = new FormData();
     form.append("po", file);
@@ -64,32 +149,28 @@ export default function TranslatePanel({}: Props) {
         const txt = await res.text();
         throw new Error(`${res.status} ${txt}`);
       }
+      
+      if (!res.body) {
+        throw new Error("Response body is missing");
+      }
+      const reader = res.body.getReader();
 
-      const reader = res.body!.getReader();
-      const dec = new TextDecoder();
+      let currentDone = 0;
 
-      let leftover = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const chunk = dec.decode(value, { stream: true });
-        leftover += chunk;
-        const lines = leftover.split("\n");
-        leftover = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const msg = JSON.parse(line);
-          if (msg.type === "meta") {
-            setProgress((p) => ({ ...p, total: msg.total || 0 }));
-          } else if (msg.type === "progress") {
-            setProgress({
-              done: msg.done ?? 0,
-              total: msg.total ?? 0,
-              echoed: msg.echoed ?? 0,
-            });
-          } else if (msg.type === "done") {
-            const b = msg.zipBase64 as string;
+      await streamAndParseAIResponse(
+        reader, 
+        (meta) => { // onMeta
+          setStatus(`Found ${meta.total} strings. Translating...`);
+          setProgress(p => ({ ...p, total: meta.total || 0 }));
+        },
+        (batchItems) => { // onBatch
+            currentDone += batchItems.length;
+            setProgress(p => ({ ...p, done: currentDone }));
+            setStatus(`Translated ${currentDone} of ${p.total} strings...`);
+        },
+        (doneEvent) => { // onDone
+            setStatus("Translation complete! Preparing download...");
+            const b = doneEvent.zipBase64 as string;
             const blob = b64ToBlob(b, "application/zip");
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
@@ -97,13 +178,19 @@ export default function TranslatePanel({}: Props) {
             a.download = "translations.zip";
             a.click();
             URL.revokeObjectURL(url);
-          } else if (msg.type === "error") {
-            setError(msg.message || "Unknown error");
-          }
-        }
-      }
+        },
+        (errorEvent) => { // onError
+            setError(errorEvent.message || "An unknown error occurred");
+        },
+        aborter.signal
+      );
+
     } catch (e: any) {
-      setError(e.message || String(e));
+      if (e.name !== 'AbortError') {
+        setError(e.message || String(e));
+      } else {
+        setStatus("Translation cancelled.");
+      }
     } finally {
       setIsTranslating(false);
       controllerRef.current = null;
@@ -117,6 +204,12 @@ export default function TranslatePanel({}: Props) {
       .map((_, i) => byteCharacters.charCodeAt(i));
     const byteArray = new Uint8Array(byteNumbers);
     return new Blob([byteArray], { type: contentType });
+  }
+
+  function cancelTranslation() {
+    if (controllerRef.current) {
+      controllerRef.current.abort();
+    }
   }
 
   return (
@@ -171,28 +264,42 @@ export default function TranslatePanel({}: Props) {
         </div>
       </div>
 
-      <Button disabled={isTranslating} onClick={handleTranslateNDJSON}>
-        {isTranslating ? "Translating…" : "Translate with progress"}
-      </Button>
+      <div className="flex items-center gap-4">
+        <Button disabled={isTranslating || !file || selectedLocales.length === 0} onClick={handleTranslateNDJSON}>
+          {isTranslating ? "Translating…" : "Translate"}
+        </Button>
+        {isTranslating && (
+          <Button onClick={cancelTranslation} className="bg-gray-200 text-gray-800 hover:bg-gray-300">
+            Cancel
+          </Button>
+        )}
+      </div>
 
-      <div className="mt-4 h-2 bg-gray-200 rounded">
-        <div
-          className="h-2 bg-black rounded"
-          style={{
-            width:
-              progress.total > 0
-                ? `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%`
-                : "0%",
-          }}
-        />
-      </div>
-      <div className="text-xs text-gray-600">
-        {progress.done} / {progress.total}
-        {progress.echoed ? ` • echoed (retried): ${progress.echoed}` : ""}
-      </div>
+      {isTranslating && (
+        <div className="mt-4 space-y-2">
+          <div className="h-2 bg-gray-200 rounded overflow-hidden">
+            <div
+              className="h-2 bg-black rounded transition-all duration-300 ease-in-out"
+              style={{
+                width:
+                  progress.total > 0
+                    ? `${Math.min(100, (progress.done / progress.total) * 100)}%`
+                    : "100%", // Indeterminate
+              }}
+            />
+          </div>
+          <div className="flex justify-between text-xs text-gray-600">
+            <span>{status || "Waiting..."}</span>
+            <span>
+              {progress.total > 1 ? `${progress.done} / ${progress.total}` : ""}
+              {progress.echoed > 0 && ` (retried: ${progress.echoed})`}
+            </span>
+          </div>
+        </div>
+      )}
 
       {error && (
-        <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-red-700 text-sm">
+        <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-red-700 text-sm mt-4">
           {error}
         </div>
       )}
