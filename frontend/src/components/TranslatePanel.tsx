@@ -1,22 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { LOCALES, LocaleOption } from "../lib/locales";
-import { Button } from "../components/ui/Button"; 
-import { cn } from "../lib/cn"; 
+import { Button } from "../components/ui/Button";
+import { cn } from "../lib/cn";
 
-type Props = {};
-
-/**
- * Parses a stream of newline-delimited JSON, specifically handling the nested
- * structure of AI chat completion responses. It extracts the actual translation
- * content and calls the appropriate handler.
- */
+// Utility to stream and parse NDJSON from the translation API.
 async function streamAndParseAIResponse(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onMeta: (meta: any) => void,
-  onBatch: (batch: any) => void,
+  onBatch: (batchItems: any[]) => void,
   onDone: (done: any) => void,
   onError: (error: any) => void,
-  signal: AbortSignal
+  signal: AbortSignal,
+  onProgress?: (prog: { done: number; total: number; echoed: number }) => void
 ) {
   const dec = new TextDecoder();
   let buffer = "";
@@ -38,35 +33,39 @@ async function streamAndParseAIResponse(
       try {
         const serverEvent = JSON.parse(line);
 
-        // Handle specific server events for progress and metadata
+        // Handle server-sent event types
         if (serverEvent.type === "meta") {
           onMeta(serverEvent);
           continue;
         }
-        if (serverEvent.type === "progress") { // Keep this for potential future backend changes
-           onBatch(serverEvent.items || []);
-           continue;
+        if (serverEvent.type === "progress") {
+          // Update progress (translated count and echoed count)
+          if (onProgress) {
+            onProgress({
+              done: serverEvent.done || 0,
+              total: serverEvent.total || 0,
+              echoed: serverEvent.echoed || 0,
+            });
+          }
+          continue;
         }
         if (serverEvent.type === "done") {
           onDone(serverEvent);
           continue;
         }
-         if (serverEvent.type === "error") {
+        if (serverEvent.type === "error") {
           onError(serverEvent);
           continue;
         }
 
-        // --- Start of logic to handle raw AI responses ---
-        // This is the key part for parsing the nested structure from your logs.
-        let contentStr = null;
+        // Handle raw AI response content (if any partial responses from provider)
+        let contentStr: string | null = null;
         if (serverEvent.choices && serverEvent.choices[0]?.message?.content) {
-            contentStr = serverEvent.choices[0].message.content;
+          contentStr = serverEvent.choices[0].message.content;
         }
-
         if (contentStr) {
           try {
-            // The actual translations are a stringified JSON inside the 'content' field
-            const innerData = JSON.parse(contentStr); 
+            const innerData = JSON.parse(contentStr);
             if (innerData.items && Array.isArray(innerData.items)) {
               onBatch(innerData.items);
             }
@@ -74,21 +73,18 @@ async function streamAndParseAIResponse(
             console.error("Failed to parse inner JSON from AI content:", contentStr, e);
           }
         }
-        // --- End of logic to handle raw AI responses ---
-
       } catch (e) {
-        console.error("Failed to parse outer NDJSON line:", line, e);
+        console.error("Failed to parse NDJSON line:", line, e);
       }
     }
-    
+
     await read();
   };
-  
+
   await read();
 }
 
-
-export default function TranslatePanel({}: Props) {
+export default function TranslatePanel() {
   const [file, setFile] = useState<File | null>(null);
   const [sourceLang, setSourceLang] = useState("en");
   const [selectedLocales, setSelectedLocales] = useState<LocaleOption[]>([]);
@@ -96,14 +92,14 @@ export default function TranslatePanel({}: Props) {
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isTranslating, setIsTranslating] = useState(false);
-
   const controllerRef = useRef<AbortController | null>(null);
 
+  // Reset error when inputs change
   useEffect(() => {
     setError(null);
   }, [file, sourceLang, selectedLocales]);
 
-  function onLocaleToggle(opt: LocaleOption) {
+  const onLocaleToggle = (opt: LocaleOption) => {
     setSelectedLocales((prev) => {
       const exists = prev.find((p) => p.code === opt.code);
       if (exists) {
@@ -111,36 +107,40 @@ export default function TranslatePanel({}: Props) {
       }
       return [...prev, opt];
     });
-  }
+  };
 
-  async function handleTranslateNDJSON() {
+  const handleTranslateNDJSON = async () => {
     if (!file) {
       setError("Please choose a PO file first.");
       return;
     }
     if (selectedLocales.length === 0) {
-      setError("Choose at least one locale.");
+      setError("Choose at least one target locale.");
       return;
     }
 
     setIsTranslating(true);
     setError(null);
     setStatus("Initializing translation...");
-    setProgress({ done: 0, total: 1, echoed: 0 }); // Set total to 1 to show indeterminate progress initially
+    // Set an indeterminate progress bar until meta arrives
+    setProgress({ done: 0, total: 0, echoed: 0 });
 
+    // Prepare form data
     const form = new FormData();
     form.append("po", file);
-    form.append(
-      "locales",
-      selectedLocales.map((l) => l.code).join(",")
-    );
+    form.append("locales", selectedLocales.map((l) => l.code).join(","));
     form.append("sourceLang", sourceLang);
+
+    // Determine API base URL from environment or use localhost
+    const API_BASE =
+      (import.meta as any).env?.VITE_BACKEND_URL?.replace(/\/$/, "") ||
+      "http://localhost:8000";
 
     const aborter = new AbortController();
     controllerRef.current = aborter;
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/translate/ndjson", {
+      const res = await fetch(`${API_BASE}/translate/ndjson`, {
         method: "POST",
         body: form,
         signal: aborter.signal,
@@ -149,44 +149,61 @@ export default function TranslatePanel({}: Props) {
         const txt = await res.text();
         throw new Error(`${res.status} ${txt}`);
       }
-      
       if (!res.body) {
-        throw new Error("Response body is missing");
+        throw new Error("No response body from translation API");
       }
       const reader = res.body.getReader();
 
       let currentDone = 0;
-
+      let totalCount = 0;
+      // Stream parsing callbacks
       await streamAndParseAIResponse(
-        reader, 
-        (meta) => { // onMeta
+        reader,
+        // onMeta: initialize total count
+        (meta) => {
+          totalCount = meta.total || 0;
+          setProgress((p) => ({ ...p, total: totalCount, done: 0, echoed: 0 }));
           setStatus(`Found ${meta.total} strings. Translating...`);
-          setProgress(p => ({ ...p, total: meta.total || 0 }));
         },
-        (batchItems) => { // onBatch
-            currentDone += batchItems.length;
-            setProgress(p => ({ ...p, done: currentDone }));
-            setStatus(`Translated ${currentDone} of ${p.total} strings...`);
+        // onBatch: handle any batch of translated items (if provider streams partial JSON)
+        (batchItems) => {
+          currentDone += batchItems.length;
+          setProgress((p) => ({ ...p, done: currentDone }));
+          // Update status with current progress (using totalCount from meta)
+          setStatus(`Translated ${currentDone} of ${totalCount} strings...`);
         },
-        (doneEvent) => { // onDone
-            setStatus("Translation complete! Preparing download...");
-            const b = doneEvent.zipBase64 as string;
-            const blob = b64ToBlob(b, "application/zip");
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "translations.zip";
-            a.click();
-            URL.revokeObjectURL(url);
+        // onDone: all translations finished, provide download
+        (doneEvent) => {
+          setStatus("Translation complete! Preparing download...");
+          const b64 = doneEvent.zipBase64 as string;
+          const blob = b64ToBlob(b64, "application/zip");
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "translations.zip";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
         },
-        (errorEvent) => { // onError
-            setError(errorEvent.message || "An unknown error occurred");
+        // onError: handle errors from stream
+        (errorEvent) => {
+          setError(errorEvent.message || "An unknown error occurred during translation.");
         },
-        aborter.signal
+        aborter.signal,
+        // onProgress: update progress state from server-sent progress events
+        (prog) => {
+          setProgress((prev) => ({
+            ...prev,
+            done: prog.done,
+            total: prog.total,
+            echoed: prog.echoed,
+          }));
+          setStatus(`Translated ${prog.done} of ${prog.total} strings...`);
+        }
       );
-
     } catch (e: any) {
-      if (e.name !== 'AbortError') {
+      if (e.name !== "AbortError") {
         setError(e.message || String(e));
       } else {
         setStatus("Translation cancelled.");
@@ -195,25 +212,26 @@ export default function TranslatePanel({}: Props) {
       setIsTranslating(false);
       controllerRef.current = null;
     }
-  }
+  };
 
-  function b64ToBlob(b64: string, contentType: string) {
+  const b64ToBlob = (b64: string, contentType: string) => {
     const byteCharacters = atob(b64);
     const byteNumbers = new Array(byteCharacters.length)
       .fill(0)
       .map((_, i) => byteCharacters.charCodeAt(i));
     const byteArray = new Uint8Array(byteNumbers);
     return new Blob([byteArray], { type: contentType });
-  }
+  };
 
-  function cancelTranslation() {
+  const cancelTranslation = () => {
     if (controllerRef.current) {
       controllerRef.current.abort();
     }
-  }
+  };
 
   return (
     <div className="space-y-6">
+      {/* File input and action buttons */}
       <div className="space-y-2">
         <label className="text-sm font-medium">PO file</label>
         <input
@@ -265,7 +283,10 @@ export default function TranslatePanel({}: Props) {
       </div>
 
       <div className="flex items-center gap-4">
-        <Button disabled={isTranslating || !file || selectedLocales.length === 0} onClick={handleTranslateNDJSON}>
+        <Button
+          disabled={isTranslating || !file || selectedLocales.length === 0}
+          onClick={handleTranslateNDJSON}
+        >
           {isTranslating ? "Translating…" : "Translate"}
         </Button>
         {isTranslating && (
@@ -275,6 +296,7 @@ export default function TranslatePanel({}: Props) {
         )}
       </div>
 
+      {/* Progress bar and status */}
       {isTranslating && (
         <div className="mt-4 space-y-2">
           <div className="h-2 bg-gray-200 rounded overflow-hidden">
@@ -284,7 +306,7 @@ export default function TranslatePanel({}: Props) {
                 width:
                   progress.total > 0
                     ? `${Math.min(100, (progress.done / progress.total) * 100)}%`
-                    : "100%", // Indeterminate
+                    : "100%", // indeterminate if total not known
               }}
             />
           </div>
@@ -298,6 +320,7 @@ export default function TranslatePanel({}: Props) {
         </div>
       )}
 
+      {/* Error message display */}
       {error && (
         <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-red-700 text-sm mt-4">
           {error}
