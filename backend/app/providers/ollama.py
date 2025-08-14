@@ -1,131 +1,87 @@
+# backend/app/providers/ollama.py
 from __future__ import annotations
-
 import json
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import httpx
 
-from ..schemas import Settings
-from ..utils.debug_buffer import push as debug_push
-from .openai_compat import extract_json_safely, BEGIN, END  # reuse extractor + markers
 
-_FEWSHOT = (
-    'Example input:\n'
-    '{"items":[{"key":"A|p0","text":"%d result"},{"key":"A|p1","text":"%d results"},{"key":"B","text":"Add to cart"}]}\n'
-    'Example output (Spanish):\n'
-    f'{BEGIN}{{"items":[{{"key":"A|p0","text":"%d resultado"}},{{"key":"A|p1","text":"%d resultados"}},{{"key":"B","text":"Añadir al carrito"}}]}}{END}'
-)
+def _extract_json_object(s: str) -> dict:
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in provider content")
+    return json.loads(s[start:end + 1])
+
 
 class OllamaProvider:
-    """
-    Provider for native Ollama / LM Studio compatible endpoints.
-    Implements translate_batch -> { key: text }.
-    """
-
-    def __init__(self, settings: Settings):
-        s = settings.normalized()
-        ol = s.ollama
-        self.host: str = (ol.get("host") or "http://localhost:11434").rstrip("/")
-        self.model: str = ol.get("model") or "llama3.1"
-        self.temperature: float = float(ol.get("temperature") or 0.2)
-        self.session = httpx.AsyncClient(timeout=60)
-
-    async def _chat_or_generate(self, prompt_obj: Dict[str, Any]) -> str:
-        """
-        Try /api/chat first, then fallback to /api/generate.
-        Return textual content to parse.
-        """
-        # --- /api/chat ---
-        try:
-            body = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": prompt_obj["system"]},
-                    {"role": "user", "content": prompt_obj["user"]},
-                ],
-                "options": {"temperature": self.temperature},
-                "stream": False,
-            }
-            r = await self.session.post(f"{self.host}/api/chat", json=body)
-            if r.status_code < 400:
-                data = r.json()
-                debug_push({"where": "ollama.chat.response", "json": data})
-                content = data.get("message", {}).get("content", "")
-                if content:
-                    return content
-        except Exception as e:
-            debug_push({"where": "ollama.chat.error", "error": str(e)})
-
-        # --- /api/generate ---
-        body = {
-            "model": self.model,
-            "prompt": f"{prompt_obj['system']}\n\n{prompt_obj['user']}",
-            "options": {"temperature": self.temperature},
-            "stream": False,
-        }
-        r = await self.session.post(f"{self.host}/api/generate", json=body)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:200]}")
-        data = r.json()
-        debug_push({"where": "ollama.generate.response", "json": data})
-        return data.get("response", "")
+    def __init__(self, host: str = "http://localhost:11434", model: str = "llama3", temperature: float = 0.2, timeout_seconds: int = 900):
+        self.host = host.rstrip("/")
+        self.model = model
+        self.temperature = float(temperature)
+        self.timeout = httpx.Timeout(
+            timeout=None,
+            connect=30.0,
+            read=float(timeout_seconds),
+            write=120.0,
+            pool=120.0,
+        )
 
     async def translate_batch(
         self,
-        batch: List[Dict[str, Any]],
+        batch: List[dict],
         source_lang: str,
         target_locale: str,
         system_prompt: str,
         glossary: str,
     ) -> Dict[str, str]:
-        sys = (system_prompt or "").strip() or "You are a translation engine for WordPress PO strings."
-
-        rules_base = (
-            "Translate every item from the source language to the target locale provided. "
-            "You MUST output strict JSON and NOTHING else. "
-            f"Wrap the JSON between the markers {BEGIN} and {END}. "
-            'The JSON must be {"items":[{"key":"...","text":"..."}]}. '
-            "Preserve placeholders exactly: %s, %1$s, %d, {name}, {{var}}, and HTML tags. "
-            "If key ends with |p0, |p1, ... produce the correct plural form for that index. "
-            "Do NOT echo the source text unless it is already in the target language.\n"
-            f"{_FEWSHOT}"
-        )
-        if glossary.strip():
-            rules_base += f"\nUntranslatable/fixed terms (keep exactly as-is): {glossary.strip().replace('\n', ', ')}."
-
-        # IMPORTANT: coerce keys to strings going OUT
-        items_min = [{"key": str(it["key"]), "text": it["text"]} for it in batch]
-        base_payload = {
-            "source_language": source_lang,
-            "target_locale": target_locale,
-            "items": items_min,
+        user_payload = [{"key": it["key"], "text": it["text"]} for it in batch]
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt or "Return ONLY strict JSON."},
+                {"role": "user", "content": json.dumps(
+                    {
+                        "source_lang": source_lang,
+                        "target_locale": target_locale,
+                        "glossary": glossary or "",
+                        "items": user_payload,
+                    },
+                    ensure_ascii=False,
+                )},
+            ],
+            "options": {"temperature": self.temperature},
+            "stream": False,
         }
 
-        def make_prompt(extra_rule: str = ""):
-            user = json.dumps(base_payload, ensure_ascii=False)
-            return {
-                "system": f"{sys}\n{rules_base}\n{extra_rule}".strip(),
-                "user": user,
-            }
+        url = f"{self.host}/api/chat"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                r = await client.post(url, json=body)
+            except httpx.ReadTimeout as e:
+                raise ValueError(f"Ollama read timeout: {e}") from e
+            except httpx.ConnectError as e:
+                raise ValueError(f"Ollama connect error: {e}") from e
+            except httpx.HTTPError as e:
+                raise ValueError(f"Ollama HTTP error: {e}") from e
 
-        # First attempt
-        content = await self._chat_or_generate(make_prompt())
-        parsed = extract_json_safely(content)
+        if r.status_code >= 400:
+            raise ValueError(f"Ollama HTTP {r.status_code}: {r.text[:500]}")
 
-        # Detect echoes (unchanged outputs)
-        src_map = {it["key"]: it["text"] for it in items_min}
-        unchanged = [it for it in parsed["items"] if src_map.get(it["key"]) == it["text"]]
+        data = r.json()
+        try:
+            content = data["message"]["content"]
+        except Exception as e:
+            raise ValueError(f"Ollama unexpected schema: {e}. Body snippet: {str(data)[:300]}") from e
 
-        # If too many echoes (>= 20%), retry once with stricter rule
-        if unchanged and len(unchanged) >= max(1, len(items_min) // 5):
-            strict = (
-                "Never return the source text verbatim; you MUST translate into the target locale "
-                "unless it is already in that language."
-            )
-            content2 = await self._chat_or_generate(make_prompt(strict))
-            parsed = extract_json_safely(content2)
-
+        obj = _extract_json_object(content)
+        items = obj.get("items")
+        if not isinstance(items, list):
+            raise ValueError("JSON missing 'items' array")
         out: Dict[str, str] = {}
-        for it in parsed["items"]:
-            out[str(it["key"])] = it["text"]
+        for it in items:
+            k, v = it.get("key"), it.get("text")
+            if k is None or v is None:
+                raise ValueError("Each item must have 'key' and 'text'")
+            out[str(k)] = str(v)
         return out
