@@ -1,3 +1,4 @@
+# app/providers/openai_compat.py
 from __future__ import annotations
 import json
 from typing import Dict, List, Optional, Any
@@ -7,7 +8,7 @@ import httpx
 
 def extract_json_safely(content: str) -> dict:
     """
-    Tolerant JSON extractor used by /providers/verify.
+    Tolerant JSON extractor used by /providers/verify and batch parsing.
     Finds the outermost { ... } in 'content' and parses it.
     Raises ValueError if not found or invalid.
     """
@@ -23,10 +24,8 @@ def extract_json_safely(content: str) -> dict:
 class OpenAICompatProvider:
     """
     Backward-compatible constructor:
-      - Pattern A used by your main.py:
-          OpenAICompatProvider(settings_obj)
-      - Pattern B if you ever call it directly:
-          OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
+      - Pattern A (your main.py): OpenAICompatProvider(settings_obj)
+      - Pattern B: OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
     """
 
     def __init__(
@@ -35,15 +34,14 @@ class OpenAICompatProvider:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
-        timeout_seconds: int = 900,
+        timeout_seconds: int = 900,  # generous for local servers
     ):
-        # Pattern A: settings object with .openai_compat dict-like
+        # Pattern A: first arg is a settings object
         if api_key is None and model is None and not isinstance(base_url_or_settings, str):
             s = base_url_or_settings
             oc = getattr(s, "openai_compat", None)
             if oc is None:
                 raise ValueError("Settings object missing 'openai_compat'")
-            # oc may be a pydantic model or a dict
             def get(obj, key, default=None):
                 return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
             base_url = get(oc, "base_url")
@@ -64,9 +62,9 @@ class OpenAICompatProvider:
         self.model = str(model)
         self.temperature = float(temperature)
 
-        # Very generous timeouts to avoid “Client disconnected” with local servers
+        # Prevent LM Studio “Client disconnected” by allowing long generations
         self.timeout = httpx.Timeout(
-            timeout=None,      # no total cap
+            timeout=None,      # total
             connect=30.0,
             read=float(timeout_seconds),
             write=120.0,
@@ -91,6 +89,8 @@ class OpenAICompatProvider:
 
         user_payload = [{"key": it["key"], "text": it["text"]} for it in batch]
 
+        # DO NOT set response_format to avoid LM Studio 400:
+        # {"error":"'response_format.type' must be 'json_schema' or 'text'"}
         body = {
             "model": self.model,
             "temperature": self.temperature,
@@ -109,8 +109,6 @@ class OpenAICompatProvider:
                     ),
                 },
             ],
-            # Many OpenAI-compatible servers honor this. If ignored, we still parse safely.
-            "response_format": {"type": "json_object"},
             "stream": False,
         }
 
@@ -126,6 +124,7 @@ class OpenAICompatProvider:
                 raise ValueError(f"HTTP error contacting provider: {e}") from e
 
         if r.status_code >= 400:
+            # Surface server text to the UI
             raise ValueError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
 
         data = r.json()
@@ -137,7 +136,9 @@ class OpenAICompatProvider:
         try:
             obj = extract_json_safely(content)
         except Exception as e:
-            raise ValueError(f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}") from e
+            raise ValueError(
+                f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}"
+            ) from e
 
         items = obj.get("items")
         if not isinstance(items, list):
