@@ -1,8 +1,15 @@
 from __future__ import annotations
 import json
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 import httpx
+
+# Optional debug recorder used by /debug/provider/recent
+try:
+    from app.utils.debug_buffer import record as dbg_record
+except Exception:  # pragma: no cover
+    def dbg_record(*args, **kwargs):  # type: ignore
+        pass
 
 
 def _extract_json_object(content: str) -> dict:
@@ -17,9 +24,10 @@ def _extract_json_object(content: str) -> dict:
 
 class OllamaProvider:
     """
-    Backward-compatible constructor:
-      - OllamaProvider(settings_obj)
-      - OllamaProvider(host, model, temperature=0.2, timeout_seconds=900)
+    Back-compatible constructor:
+
+      A) OllamaProvider(settings_obj)
+      B) OllamaProvider(host, model, temperature=0.2, timeout_seconds=900)
     """
 
     def __init__(
@@ -65,19 +73,27 @@ class OllamaProvider:
         if len(batch) > 300:
             raise ValueError("Batch too large (>300)")
 
-        user_payload = [{"key": it["key"], "text": it["text"]} for it in batch]
+        payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
+        rules = (
+            "Return STRICT JSON only. Do not add commentary. "
+            "Output an object with exactly one field: items. "
+            "items is an array of objects with the SAME keys you received. "
+            "Every input key MUST appear exactly once in items. "
+            "Never invent keys. Preserve placeholder tokens and HTML tags."
+        )
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt or "Return ONLY strict JSON."},
+                {"role": "system", "content": system_prompt or "You translate WordPress strings. " + rules},
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
+                            "instructions": rules,
                             "source_lang": source_lang,
                             "target_locale": target_locale,
                             "glossary": glossary or "",
-                            "items": user_payload,
+                            "items": payload_items,
                         },
                         ensure_ascii=False,
                     ),
@@ -88,6 +104,8 @@ class OllamaProvider:
         }
 
         url = f"{self.host}/api/chat"
+        dbg_record({"provider": "ollama", "dir": "request", "n": len(payload_items), "model": self.model})
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
                 r = await client.post(url, json=body)
@@ -107,6 +125,8 @@ class OllamaProvider:
         except Exception as e:
             raise ValueError(f"Ollama unexpected schema: {e}. Body snippet: {str(data)[:300]}") from e
 
+        dbg_record({"provider": "ollama", "dir": "response", "snippet": content[:200]})
+
         try:
             obj = _extract_json_object(content)
         except Exception as e:
@@ -124,4 +144,5 @@ class OllamaProvider:
                 raise ValueError("Each item must have 'key' and 'text'")
             out[str(k)] = str(v)
 
+        dbg_record({"provider": "ollama", "dir": "parsed", "count": len(out)})
         return out

@@ -1,16 +1,21 @@
-# app/providers/openai_compat.py
 from __future__ import annotations
 import json
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 import httpx
+
+# Optional debug recorder used by /debug/provider/recent
+try:
+    from app.utils.debug_buffer import record as dbg_record
+except Exception:  # pragma: no cover
+    def dbg_record(*args, **kwargs):  # type: ignore
+        pass
 
 
 def extract_json_safely(content: str) -> dict:
     """
-    Tolerant JSON extractor used by /providers/verify and batch parsing.
-    Finds the outermost { ... } in 'content' and parses it.
-    Raises ValueError if not found or invalid.
+    Find the outermost {...} in 'content' and parse it.
+    Raise ValueError if no single JSON object can be found.
     """
     if not isinstance(content, str):
         raise ValueError("Provider content is not a string")
@@ -21,11 +26,44 @@ def extract_json_safely(content: str) -> dict:
     return json.loads(content[start : end + 1])
 
 
+def _json_schema_format() -> dict:
+    """
+    JSON Schema to force an object with 'items' array containing {key, text}.
+    This matches LM Studio's requirement: response_format.type = 'json_schema'.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "wp_translation_items",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["items"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["key", "text"],
+                            "properties": {
+                                "key": {"type": "string"},
+                                "text": {"type": "string"},
+                            },
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+
 class OpenAICompatProvider:
     """
-    Backward-compatible constructor:
-      - Pattern A (your main.py): OpenAICompatProvider(settings_obj)
-      - Pattern B: OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
+    Back-compatible constructor:
+
+      A) OpenAICompatProvider(settings_obj)
+      B) OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
     """
 
     def __init__(
@@ -34,9 +72,9 @@ class OpenAICompatProvider:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
-        timeout_seconds: int = 900,  # generous for local servers
+        timeout_seconds: int = 900,
     ):
-        # Pattern A: first arg is a settings object
+        # Pattern A: settings object
         if api_key is None and model is None and not isinstance(base_url_or_settings, str):
             s = base_url_or_settings
             oc = getattr(s, "openai_compat", None)
@@ -62,9 +100,9 @@ class OpenAICompatProvider:
         self.model = str(model)
         self.temperature = float(temperature)
 
-        # Prevent LM Studio “Client disconnected” by allowing long generations
+        # Generous timeouts to avoid "Client disconnected" on local servers
         self.timeout = httpx.Timeout(
-            timeout=None,      # total
+            timeout=None,
             connect=30.0,
             read=float(timeout_seconds),
             write=120.0,
@@ -87,23 +125,29 @@ class OpenAICompatProvider:
         if len(batch) > 300:
             raise ValueError("Batch too large (>300)")
 
-        user_payload = [{"key": it["key"], "text": it["text"]} for it in batch]
+        payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
+        rules = (
+            "Return STRICT JSON only. Do not add commentary. "
+            "Output an object with exactly one field: items. "
+            "items is an array of objects with the SAME keys you received. "
+            "Every input key MUST appear exactly once in items. "
+            "Never invent keys. Preserve placeholder tokens and HTML tags."
+        )
 
-        # DO NOT set response_format to avoid LM Studio 400:
-        # {"error":"'response_format.type' must be 'json_schema' or 'text'"}
-        body = {
+        base_body = {
             "model": self.model,
             "temperature": self.temperature,
             "messages": [
-                {"role": "system", "content": system_prompt or "Return ONLY strict JSON."},
+                {"role": "system", "content": system_prompt or "You translate WordPress strings. " + rules},
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
+                            "instructions": rules,
                             "source_lang": source_lang,
                             "target_locale": target_locale,
                             "glossary": glossary or "",
-                            "items": user_payload,
+                            "items": payload_items,
                         },
                         ensure_ascii=False,
                     ),
@@ -113,7 +157,12 @@ class OpenAICompatProvider:
         }
 
         url = f"{self.base_url}/chat/completions"
+        dbg_record({"provider": "openai_compat", "dir": "request", "n": len(payload_items), "model": self.model})
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
+            # Try JSON Schema mode first
+            body = dict(base_body)
+            body["response_format"] = _json_schema_format()
             try:
                 r = await client.post(url, headers=self.headers, json=body)
             except httpx.ReadTimeout as e:
@@ -123,22 +172,40 @@ class OpenAICompatProvider:
             except httpx.HTTPError as e:
                 raise ValueError(f"HTTP error contacting provider: {e}") from e
 
+            # Fallback to text mode if the server rejects json_schema
+            if r.status_code == 400:
+                # LM Studio returns a JSON error body. Keep it visible if fallback also fails.
+                schema_err_snippet = r.text[:200]
+                r = await client.post(url, headers=self.headers, json=base_body)
+                if r.status_code >= 400:
+                    raise ValueError(f"Provider HTTP 400 with schema, then HTTP {r.status_code}: {r.text[:300]} | First error: {schema_err_snippet}")
+
         if r.status_code >= 400:
-            # Surface server text to the UI
             raise ValueError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
 
         data = r.json()
+        # Try multiple common shapes
+        content: Optional[str] = None
         try:
             content = data["choices"][0]["message"]["content"]
-        except Exception as e:
-            raise ValueError(f"Unexpected provider schema: {e}. Body snippet: {str(data)[:300]}") from e
+        except Exception:
+            # Some servers use 'text' instead
+            content = data.get("choices", [{}])[0].get("text") or data.get("response")
 
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"Unexpected provider schema or empty content. Body snippet: {str(data)[:300]}")
+
+        dbg_record({"provider": "openai_compat", "dir": "response", "snippet": content[:200]})
+
+        # Parse JSON. If the model wrapped JSON in {"response": "..."} then unwrap and parse that string.
         try:
             obj = extract_json_safely(content)
+            unwrap_guard = 0
+            while "items" not in obj and isinstance(obj.get("response"), str) and unwrap_guard < 2:
+                obj = extract_json_safely(obj["response"])
+                unwrap_guard += 1
         except Exception as e:
-            raise ValueError(
-                f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}"
-            ) from e
+            raise ValueError(f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}") from e
 
         items = obj.get("items")
         if not isinstance(items, list):
@@ -152,4 +219,5 @@ class OpenAICompatProvider:
                 raise ValueError("Each item must have 'key' and 'text'")
             out[str(k)] = str(v)
 
+        dbg_record({"provider": "openai_compat", "dir": "parsed", "count": len(out)})
         return out
