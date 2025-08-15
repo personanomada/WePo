@@ -394,22 +394,26 @@ async def _translate_items_with_retries(
 ) -> Dict[str, str]:
     """
     Sends items in batches; retries missing/echoed-only items up to MAX_RETRIES.
-    Progress increments only when new keys are actually filled.
+    On the final attempt:
+      - drop to micro-batches (size=1) for any stragglers
+      - then auto-fill echo-safe items (numbers/URLs/pure symbols or exact glossary terms)
     """
-    # Clamp batch_size between 10 and 300 to respect safe range
+    # Clamp to safe range
     batch_size = max(10, min(300, int(batch_size or 40)))
+
     remaining: Dict[str, dict] = {it["key"]: it for it in all_items}
     translated: Dict[str, str] = {}
 
-    def _batches(values: Iterable[dict]) -> List[List[dict]]:
-        lst = list(values)
-        return [lst[i: i + batch_size] for i in range(0, len(lst), batch_size)]
+    def make_batches(values: Iterable[dict], size: int) -> List[List[dict]]:
+        data = list(values)
+        return [data[i : i + size] for i in range(0, len(data), size)]
 
-    for attempt in range(1, MAX_RETRIES + 2):
+    # Normal retry passes
+    for attempt in range(1, MAX_RETRIES + 1):
         if not remaining:
             break
 
-        for batch in _batches(list(remaining.values())):
+        for batch in make_batches(list(remaining.values()), batch_size):
             try:
                 result = await provider.translate_batch(
                     batch=batch,
@@ -429,7 +433,7 @@ async def _translate_items_with_retries(
                 if k not in remaining:
                     continue
                 src_text = remaining[k]["text"]
-                # If the translation exactly equals the source and it's *not* an allowed echo, treat as not translated
+                # If model echoed exactly and echo is not allowed, count as echoed
                 if v == src_text and not _allow_echo(src_text, glossary):
                     echoed += 1
                     continue
@@ -437,12 +441,49 @@ async def _translate_items_with_retries(
                 del remaining[k]
                 newly += 1
 
-            # Report progress for this batch if any items were translated or skipped as echoes
             if on_batch_progress and (newly > 0 or echoed > 0):
                 await on_batch_progress(newly, echoed)
 
+    # Last-chance micro-batch pass for any stragglers
     if remaining:
-        # If after retries some keys are still untranslated, raise an error
+        for k in list(remaining.keys()):
+            item = remaining[k]
+            try:
+                result = await provider.translate_batch(
+                    batch=[item],
+                    source_lang=source_lang,
+                    target_locale=target_locale,
+                    system_prompt=system_prompt,
+                    glossary=glossary,
+                )
+            except Exception:
+                continue
+
+            v = (result or {}).get(k)
+            if v is not None:
+                src_text = item["text"]
+                if v == src_text and not _allow_echo(src_text, glossary):
+                    # reject non-allowed echo
+                    pass
+                else:
+                    translated[k] = v
+                    del remaining[k]
+                    if on_batch_progress:
+                        await on_batch_progress(1, 0)
+
+    # Echo-safe fallback to avoid failing the whole job for numbers and similar strings
+    if remaining:
+        autofilled = 0
+        for k in list(remaining.keys()):
+            src_text = remaining[k]["text"]
+            if _allow_echo(src_text, glossary):
+                translated[k] = src_text
+                del remaining[k]
+                autofilled += 1
+        if autofilled and on_batch_progress:
+            await on_batch_progress(autofilled, 0)
+
+    if remaining:
         first_missing = next(iter(remaining.keys()))
         raise HTTPException(
             status_code=400,
@@ -567,31 +608,34 @@ async def translate_ndjson(
         raise HTTPException(status_code=400, detail="No target locales provided")
 
     async def generator():
+        # Total across all locales so the bar can reflect the full job
         total_strings_per_locale = {loc: len(_build_items_for_locale(src_catalog, loc)[0]) for loc in locales_list}
         grand_total = sum(total_strings_per_locale.values())
 
+        # Tell the UI how many strings in total we expect
         yield json.dumps({"type": "meta", "total": grand_total}) + "\n"
 
         produced: Dict[str, polib.POFile] = {}
         overall_done = 0
         overall_echoed = 0
-        
-        progress_buffer = []
 
-        # **FIX**: `on_progress` is now a regular function that appends to a buffer.
-        async def on_progress(newly: int, echoed: int):
-            nonlocal overall_done, overall_echoed
-            overall_done += newly
-            overall_echoed += echoed
-            progress_buffer.append(json.dumps(
-                {"type": "progress", "done": overall_done, "total": grand_total, "echoed": overall_echoed}
-            ) + "\n")
+        for loc in locales_list:
+            progress_q: asyncio.Queue[str] = asyncio.Queue()
 
-        try:
-            for loc in locales_list:
+            async def on_progress(newly: int, echoed: int):
+                nonlocal overall_done, overall_echoed
+                overall_done += newly
+                overall_echoed += echoed
+                await progress_q.put(
+                    json.dumps(
+                        {"type": "progress", "done": overall_done, "total": grand_total, "echoed": overall_echoed}
+                    )
+                    + "\n"
+                )
+
+            async def run_locale() -> Dict[str, str]:
                 all_items_for_locale, _ = _build_items_for_locale(src_catalog, loc)
-                
-                translated_map = await _translate_items_with_retries(
+                return await _translate_items_with_retries(
                     provider=provider,
                     all_items=all_items_for_locale,
                     source_lang=sourceLang,
@@ -601,29 +645,44 @@ async def translate_ndjson(
                     glossary=s.glossary,
                     on_batch_progress=on_progress,
                 )
-                
-                # **FIX**: Yield any buffered progress immediately after a batch.
-                for progress_item in progress_buffer:
-                    yield progress_item
-                progress_buffer.clear()
 
-                out = _clone_catalog_structure(src_catalog)
-                out.metadata["Language"] = loc
-                out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
-                _fill_catalog_from_map(src_catalog, out, translated_map, loc)
-                produced[loc] = out
+            task = asyncio.create_task(run_locale())
 
-            zip_bytes = _build_zip_bytes(produced)
-            b64 = base64.b64encode(zip_bytes).decode("ascii")
-            yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
+            # While the locale is translating, stream queued progress or heartbeat
+            while True:
+                if task.done() and progress_q.empty():
+                    break
+                try:
+                    line = await asyncio.wait_for(progress_q.get(), timeout=10.0)
+                    yield line
+                except asyncio.TimeoutError:
+                    yield json.dumps({"type": "heartbeat"}) + "\n"
 
-        except HTTPException as he:
-            yield json.dumps({"type": "error", "message": he.detail}) + "\n"
-        except Exception as e:
-            log.exception("Error during translation stream")
-            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+            # Send any provider error immediately
+            try:
+                translated_map = task.result()
+            except HTTPException as he:
+                yield json.dumps({"type": "error", "message": he.detail}) + "\n"
+                return
+            except Exception as e:
+                yield json.dumps({"type": "error", "message": f"Provider error: {e}"}) + "\n"
+                return
+
+            # Build the locale's PO using the translations we collected
+            out = _clone_catalog_structure(src_catalog)
+            out.metadata["Language"] = loc
+            out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
+            _fill_catalog_from_map(src_catalog, out, translated_map, loc)
+            produced[loc] = out
+
+        # Package all locales into a ZIP and send it as the final event
+        zip_bytes = _build_zip_bytes(produced)
+        b64 = base64.b64encode(zip_bytes).decode("ascii")
+        yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
+
+
 
 # -----------------------------------------------------------------------------
 # Debug helpers
