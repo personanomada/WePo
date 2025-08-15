@@ -1,45 +1,78 @@
-# backend/app/providers/openai_compat.py
 from __future__ import annotations
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import httpx
 
 
-def _extract_json_object(s: str) -> dict:
+def extract_json_safely(content: str) -> dict:
     """
-    Be tolerant to extra prose. Grab the outermost { ... }.
+    Tolerant JSON extractor used by /providers/verify.
+    Finds the outermost { ... } in 'content' and parses it.
+    Raises ValueError if not found or invalid.
     """
-    if not isinstance(s, str):
-        raise ValueError("Provider 'content' is not a string")
-    start = s.find("{")
-    end = s.rfind("}")
+    if not isinstance(content, str):
+        raise ValueError("Provider content is not a string")
+    start = content.find("{")
+    end = content.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("No JSON object found in provider content")
-    return json.loads(s[start:end + 1])
+    return json.loads(content[start : end + 1])
 
 
 class OpenAICompatProvider:
+    """
+    Backward-compatible constructor:
+      - Pattern A used by your main.py:
+          OpenAICompatProvider(settings_obj)
+      - Pattern B if you ever call it directly:
+          OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
+    """
+
     def __init__(
         self,
-        base_url: str,
-        api_key: Optional[str],
-        model: str,
+        base_url_or_settings: Any,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
         temperature: float = 0.2,
-        timeout_seconds: int = 900,  # 15 minutes read timeout for slow local models
+        timeout_seconds: int = 900,
     ):
-        self.base_url = base_url.rstrip("/")
+        # Pattern A: settings object with .openai_compat dict-like
+        if api_key is None and model is None and not isinstance(base_url_or_settings, str):
+            s = base_url_or_settings
+            oc = getattr(s, "openai_compat", None)
+            if oc is None:
+                raise ValueError("Settings object missing 'openai_compat'")
+            # oc may be a pydantic model or a dict
+            def get(obj, key, default=None):
+                return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+            base_url = get(oc, "base_url")
+            api_key = get(oc, "api_key") or None
+            model = get(oc, "model")
+            temperature = float(get(oc, "temperature", temperature))
+        else:
+            # Pattern B: explicit args
+            base_url = base_url_or_settings
+
+        if not base_url:
+            raise ValueError("OpenAI-compatible base_url is required")
+        if not model:
+            raise ValueError("OpenAI-compatible model is required")
+
+        self.base_url = str(base_url).rstrip("/")
         self.api_key = api_key
-        self.model = model
+        self.model = str(model)
         self.temperature = float(temperature)
-        # Generous timeouts prevent "Client disconnected" on LM Studio
+
+        # Very generous timeouts to avoid “Client disconnected” with local servers
         self.timeout = httpx.Timeout(
-            timeout=None,            # total
+            timeout=None,      # no total cap
             connect=30.0,
             read=float(timeout_seconds),
             write=120.0,
             pool=120.0,
         )
+
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -57,13 +90,12 @@ class OpenAICompatProvider:
             raise ValueError("Batch too large (>300)")
 
         user_payload = [{"key": it["key"], "text": it["text"]} for it in batch]
-        system = system_prompt or "You return ONLY strict JSON."
 
         body = {
             "model": self.model,
             "temperature": self.temperature,
             "messages": [
-                {"role": "system", "content": system},
+                {"role": "system", "content": system_prompt or "Return ONLY strict JSON."},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -77,7 +109,8 @@ class OpenAICompatProvider:
                     ),
                 },
             ],
-            "response_format": {"type": "json_object"},  # ignored by some servers, harmless
+            # Many OpenAI-compatible servers honor this. If ignored, we still parse safely.
+            "response_format": {"type": "json_object"},
             "stream": False,
         }
 
@@ -92,10 +125,8 @@ class OpenAICompatProvider:
             except httpx.HTTPError as e:
                 raise ValueError(f"HTTP error contacting provider: {e}") from e
 
-        # If server replied with HTTP error, include body
         if r.status_code >= 400:
-            detail = r.text[:500]
-            raise ValueError(f"Provider HTTP {r.status_code}: {detail}")
+            raise ValueError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
 
         data = r.json()
         try:
@@ -104,7 +135,7 @@ class OpenAICompatProvider:
             raise ValueError(f"Unexpected provider schema: {e}. Body snippet: {str(data)[:300]}") from e
 
         try:
-            obj = _extract_json_object(content)
+            obj = extract_json_safely(content)
         except Exception as e:
             raise ValueError(f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}") from e
 
@@ -114,8 +145,10 @@ class OpenAICompatProvider:
 
         out: Dict[str, str] = {}
         for it in items:
-            k, v = it.get("key"), it.get("text")
+            k = it.get("key")
+            v = it.get("text")
             if k is None or v is None:
                 raise ValueError("Each item must have 'key' and 'text'")
             out[str(k)] = str(v)
+
         return out
