@@ -11,7 +11,7 @@ import re
 import tempfile
 from app.analyzers.po_lint import analyze_po
 import zipfile
-from typing import Dict, List, Tuple, Optional, Iterable, Callable, Awaitable
+from typing import Dict, List, Tuple, Optional, Iterable, Callable, Awaitable, Any
 
 import httpx
 import polib
@@ -117,7 +117,7 @@ def _ensure_po_file(file: UploadFile) -> None:
 
 def _coerce_headers(raw: Any) -> Dict[str, str]:
     """
-    Accept dict or a list of {key,value} pairs from UI, return a flat str->str dict.
+    Accept dict or list of {key,value} pairs; return flat str->str dict.
     """
     if not raw:
         return {}
@@ -126,7 +126,7 @@ def _coerce_headers(raw: Any) -> Dict[str, str]:
     if isinstance(raw, list):
         out: Dict[str, str] = {}
         for item in raw:
-            if isinstance(item, dict) and item.get("key"):
+            if isinstance(item, dict) and item.get("key") is not None:
                 out[str(item["key"])] = str(item.get("value", ""))
         return out
     return {}
@@ -136,103 +136,170 @@ def _provider_from_settings(s: Any):
     Build a provider instance from request settings.
 
     Accepts either:
-      • a Settings object (preferred), with nested provider configs under .openai_compat / .ollama
+      • a Settings object with nested .openai_compat / .ollama blocks
       • a plain dict, either full Settings-shaped or provider-scoped
-        e.g. {"provider":"openai_compat","openai_compat":{...}} or {"type":"ollama","model":"...","base_url":"..."}
-    """
-    # Helper to flatten headers from various shapes
-    def _headers_from(obj: Dict[str, Any]) -> Dict[str, str]:
-        return _coerce_headers(obj.get("headers") or obj.get("extra_headers"))
 
-    # If we received a Settings object, branch by its .provider and nested config
+    Compatible with providers that use either:
+      OpenAICompatProvider(model=..., api_key=..., ...)
+      OpenAICompatProvider(settings={...})
+      OpenAICompatProvider({...})  # positional dict
+    And same for OllamaProvider.
+    """
+
+    def _instantiate_openai(cfg: Dict[str, Any], provider_label: str):
+        # Normalize
+        model = cfg.get("model") or cfg.get("model_name")
+        if not model:
+            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+        api_key = cfg.get("api_key") or cfg.get("apiKey")
+        base_url = cfg.get("base_url") or cfg.get("baseUrl")
+        if not base_url:
+            base_url = (
+                "https://api.openai.com/v1"
+                if provider_label in ("openai", "openai_compat", "openai-compat")
+                else "https://openrouter.ai/api/v1"
+            )
+        temperature = float(cfg.get("temperature", 0.2))
+        timeout = int(cfg.get("timeout", 60))
+        headers = _coerce_headers(cfg.get("headers") or cfg.get("extra_headers"))
+
+        # new flags
+        use_response_format = bool(cfg.get("use_response_format", True))
+        trace = bool(cfg.get("trace", False))
+        trace_truncate = int(cfg.get("trace_truncate", 2000))
+
+        # Try keyword-style constructor
+        try:
+            return OpenAICompatProvider(
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=temperature,
+                timeout=timeout,
+                extra_headers=headers,
+                # not all builds accept these kw args; if they don't, fall through
+                use_response_format=use_response_format,
+                trace=trace,
+                trace_truncate=trace_truncate,
+            )
+        except TypeError:
+            # Try positional dict
+            try:
+                return OpenAICompatProvider(
+                    {
+                        "model": model,
+                        "api_key": api_key,
+                        "base_url": base_url,
+                        "temperature": temperature,
+                        "timeout": timeout,
+                        "headers": headers,
+                        "extra_headers": headers,
+                        "use_response_format": use_response_format,
+                        "trace": trace,
+                        "trace_truncate": trace_truncate,
+                    }
+                )
+            except TypeError:
+                # Try settings= kwarg
+                return OpenAICompatProvider(
+                    settings={
+                        "model": model,
+                        "api_key": api_key,
+                        "base_url": base_url,
+                        "temperature": temperature,
+                        "timeout": timeout,
+                        "headers": headers,
+                        "extra_headers": headers,
+                        "use_response_format": use_response_format,
+                        "trace": trace,
+                        "trace_truncate": trace_truncate,
+                    }
+                )
+
+    def _instantiate_ollama(cfg: Dict[str, Any]):
+        model = cfg.get("model") or cfg.get("model_name")
+        if not model:
+            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+        base_url = cfg.get("base_url") or cfg.get("baseUrl") or cfg.get("host") or "http://localhost:11434"
+        temperature = float(cfg.get("temperature", 0.2))
+        timeout = int(cfg.get("timeout", 120))
+        headers = _coerce_headers(cfg.get("headers") or cfg.get("extra_headers"))
+
+        # new flags
+        trace = bool(cfg.get("trace", False))
+        trace_truncate = int(cfg.get("trace_truncate", 2000))
+
+        # Try keyword-style constructor
+        try:
+            return OllamaProvider(
+                model=model,
+                base_url=base_url,
+                temperature=temperature,
+                timeout=timeout,
+                extra_headers=headers,
+                trace=trace,
+                trace_truncate=trace_truncate,
+            )
+        except TypeError:
+            # Try positional dict
+            try:
+                return OllamaProvider(
+                    {
+                        "model": model,
+                        "base_url": base_url,
+                        "temperature": temperature,
+                        "timeout": timeout,
+                        "headers": headers,
+                        "extra_headers": headers,
+                        "trace": trace,
+                        "trace_truncate": trace_truncate,
+                    }
+                )
+            except TypeError:
+                # Try settings= kwarg
+                return OllamaProvider(
+                    settings={
+                        "model": model,
+                        "base_url": base_url,
+                        "temperature": temperature,
+                        "timeout": timeout,
+                        "headers": headers,
+                        "extra_headers": headers,
+                        "trace": trace,
+                        "trace_truncate": trace_truncate,
+                    }
+                )
+
+    # 1) Settings object path
     if hasattr(s, "provider"):
         provider = (getattr(s, "provider", None) or "openai_compat").lower()
 
         if provider in ("openai", "openrouter", "openai_compat", "openai-compat"):
-            cfg: Dict[str, Any] = dict(getattr(s, "openai_compat", {}) or {})
-            model = cfg.get("model")
-            if not model:
-                raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
-
-            base_url = cfg.get("base_url") or cfg.get("baseUrl")
-            if not base_url:
-                base_url = (
-                    "https://api.openai.com/v1"
-                    if provider in ("openai", "openai_compat", "openai-compat")
-                    else "https://openrouter.ai/api/v1"
-                )
-
-            return OpenAICompatProvider(
-                model=model,
-                api_key=cfg.get("api_key") or cfg.get("apiKey"),
-                base_url=base_url,
-                temperature=float(cfg.get("temperature", 0.2)),
-                timeout=int(cfg.get("timeout", 60)),
-                extra_headers=_headers_from(cfg),
-            )
+            cfg = dict(getattr(s, "openai_compat", {}) or {})
+            return _instantiate_openai(cfg, provider)
 
         if provider in ("ollama", "local"):
-            cfg: Dict[str, Any] = dict(getattr(s, "ollama", {}) or {})
-            model = cfg.get("model")
-            if not model:
-                raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
-
-            base_url = cfg.get("base_url") or cfg.get("baseUrl") or cfg.get("host") or "http://localhost:11434"
-            return OllamaProvider(
-                model=model,
-                base_url=base_url,
-                temperature=float(cfg.get("temperature", 0.2)),
-                timeout=int(cfg.get("timeout", 120)),
-                extra_headers=_headers_from(cfg),
-            )
+            cfg = dict(getattr(s, "ollama", {}) or {})
+            return _instantiate_ollama(cfg)
 
         raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
 
-    # Otherwise, try to treat it as a dict (legacy / direct POST from UI)
+    # 2) Dict path
     if not isinstance(s, dict):
         raise HTTPException(status_code=400, detail="provider settings must be an object")
 
     provider = (s.get("provider") or s.get("type") or "openai_compat").lower()
-    temperature = float(s.get("temperature", 0.2))
-    timeout = int(s.get("timeout") or 60)
-    headers = _coerce_headers(s.get("headers") or s.get("extra_headers"))
 
     if provider in ("openai", "openrouter", "openai_compat", "openai-compat"):
-        model = s.get("model") or s.get("model_name")
-        if not model:
-            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
-
-        api_key = s.get("api_key") or s.get("apiKey")
-        base_url = s.get("base_url") or s.get("baseUrl")
-        if not base_url:
-            base_url = (
-                "https://api.openai.com/v1"
-                if provider in ("openai", "openai_compat", "openai-compat")
-                else "https://openrouter.ai/api/v1"
-            )
-
-        return OpenAICompatProvider(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            temperature=temperature,
-            timeout=timeout,
-            extra_headers=headers,
-        )
+        # Either provider-scoped dict or full settings dict
+        cfg = dict(s.get("openai_compat", {}) or s)
+        return _instantiate_openai(cfg, provider)
 
     if provider in ("ollama", "local"):
-        model = s.get("model") or s.get("model_name")
-        if not model:
-            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
-
-        base_url = s.get("base_url") or s.get("baseUrl") or s.get("host") or "http://localhost:11434"
-        return OllamaProvider(
-            model=model,
-            base_url=base_url,
-            temperature=temperature,
-            timeout=int(s.get("timeout") or 120),
-            extra_headers=headers,
-        )
+        cfg = dict(s.get("ollama", {}) or s)
+        return _instantiate_ollama(cfg)
 
     raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
 
@@ -399,6 +466,44 @@ async def analyze_apply_endpoint(
 
 @app.post("/providers/verify")
 async def verify_provider(payload: Settings):
+    """
+    Verify provider connectivity and JSON contract without importing helpers from provider modules.
+    This avoids tight coupling to provider-internal utilities.
+    """
+    # Local, robust JSON extractor: strict -> fenced block -> largest {...} span
+    def _extract_json_safely_local(text: str) -> dict:
+        if isinstance(text, dict):
+            return text
+        if not isinstance(text, str):
+            raise ValueError("non-string content")
+        s = text.strip()
+
+        # fenced ```json ... ```
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception as e:
+                raise ValueError(f"fenced non-JSON: {e}")
+
+        # direct JSON
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+
+        # largest {...} span
+        first = s.find("{")
+        last = s.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            candidate = s[first : last + 1]
+            try:
+                return json.loads(candidate)
+            except Exception as e:
+                raise ValueError(f"non-JSON or truncated JSON: {e}")
+
+        raise ValueError("no JSON object found")
+
     s = payload.normalized()
 
     if s.provider == "openai_compat":
@@ -430,6 +535,7 @@ async def verify_provider(payload: Settings):
             }
             r = await client.post(f"{base}/chat/completions", headers=headers, json=body)
 
+            # Some gateways require json_schema; try that if json_object is rejected
             if r.status_code == 400 and "response_format.type" in r.text and "json_schema" in r.text:
                 json_schema = {
                     "type": "json_schema",
@@ -456,6 +562,7 @@ async def verify_provider(payload: Settings):
                 body = {"model": model, "temperature": temp, "response_format": json_schema, "messages": messages}
                 r = await client.post(f"{base}/chat/completions", headers=headers, json=body)
 
+            # Final fallback: no response_format at all
             if r.status_code == 400 and "response_format" in r.text:
                 body = {"model": model, "temperature": temp, "messages": messages}
                 r = await client.post(f"{base}/chat/completions", headers=headers, json=body)
@@ -465,10 +572,14 @@ async def verify_provider(payload: Settings):
 
         data = r.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        from .providers.openai_compat import extract_json_safely as oa_extract
         try:
-            parsed = oa_extract(content)
-            assert isinstance(parsed.get("items"), list)
+            parsed = _extract_json_safely_local(content)
+            items = parsed.get("items")
+            if not isinstance(items, list):
+                raise ValueError("top-level 'items' missing or not an array")
+            # sanity: ensure each item is an object with key and text
+            if items and not (isinstance(items[0], dict) and "key" in items[0] and "text" in items[0]):
+                raise ValueError("each items[i] must be an object with 'key' and 'text'")
         except Exception as e:
             raise HTTPException(400, f"Model did not return strict JSON: {e}")
 
@@ -488,6 +599,7 @@ async def verify_provider(payload: Settings):
         return {"ok": True, "provider": "ollama", "details": {"models": models}}
 
     raise HTTPException(400, "Unsupported provider")
+
 
 # -----------------------------------------------------------------------------
 # Analyze + Audit (summary for UI)
@@ -615,7 +727,7 @@ async def _translate_items_with_retries(
             item["candidate"] = candidate
         return item
 
-    # Build remaining work map
+    # Build remaining work map; keep per-item expected placeholders and context if present
     remaining: Dict[str, Dict[str, Any]] = {
         str(it["key"]): {
             "key": str(it["key"]),
@@ -627,19 +739,23 @@ async def _translate_items_with_retries(
     }
 
     translated: Dict[str, str] = {}
-    pending_echo: Dict[str, Dict[str, Any]] = {}
     review_items: List[dict] = []
 
     if not remaining:
         return {}, []
 
+    # We track echo once and do not retry echoes to avoid loops
+    pending_echo: Dict[str, Dict[str, Any]] = {}
+
     for attempt in range(1, int(max_retries) + 1):
         if not remaining:
             break
 
-        batches = _chunks(list(remaining.values()), batch_size)
-        for b_index, batch in enumerate(batches, start=1):
-            # Construct provider batch, include context when present
+        before_count = len(remaining)
+        attempt_progress = 0  # accepted in this attempt
+
+        for b_index, batch in enumerate(_chunks(list(remaining.values()), batch_size), start=1):
+            # Construct provider batch; include context for disambiguation
             provider_batch = []
             for it in batch:
                 pb = {"key": it["key"], "text": it["text"]}
@@ -665,6 +781,7 @@ async def _translate_items_with_retries(
                             "batch_index": b_index,
                             "batch_size": len(batch),
                             "error": str(e)[:200],
+                            "locale": target_locale,
                         }
                     )
                 continue
@@ -678,53 +795,49 @@ async def _translate_items_with_retries(
                             "batch_index": b_index,
                             "batch_size": len(batch),
                             "error": "invalid batch result shape",
+                            "locale": target_locale,
                         }
                     )
                 continue
 
             newly, echoed = 0, 0
+
             for item in batch:
                 k = str(item["key"])
                 v = result_map.get(k)
                 src_text = item["text"]
 
                 if v is None:
-                    # model omitted this key
+                    # model omitted this key; keep it in remaining for possible retry
                     continue
 
                 v = "" if v is None else str(v)
 
-                # If model echoed source, only accept when allowlisted
+                # Ignore pure echoes unless acceptable as-is
                 if v == src_text and not _allow_echo(src_text, glossary):
                     echoed += 1
                     pending_echo[k] = {"key": k, "text": src_text}
+                    # Remove from remaining so we don't loop on it
+                    if k in remaining:
+                        del remaining[k]
                     continue
 
                 # Validate placeholders for this item
                 try:
                     validate_translation_placeholders(item.get("expected") or {}, v)
                 except ValueError as ve:
-                    # Record placeholder error for review
+                    # Record placeholder error for review; keep for later retry this attempt or micro-pass
                     review_items.append(_review_item("placeholder_error", k, src_text, candidate=v))
-                    if on_batch_detail:
-                        await on_batch_detail(
-                            {
-                                "type": "placeholder_error",
-                                "attempt": attempt,
-                                "key": k,
-                                "error": str(ve),
-                                "sample_src": src_text[:120],
-                                "sample_out": v[:120],
-                            }
-                        )
                     continue
 
                 # Accept translation
                 translated[k] = v
-                newly += 1
-                pending_echo.pop(k, None)
                 if k in remaining:
                     del remaining[k]
+                pending_echo.pop(k, None)
+                newly += 1
+
+            attempt_progress += newly
 
             if on_batch_detail:
                 await on_batch_detail(
@@ -736,11 +849,20 @@ async def _translate_items_with_retries(
                         "returned": len(result_map),
                         "accepted": newly,
                         "echoed": echoed,
-                        "missing_count": len([it for it in batch if str(it["key"]) in remaining]),
+                        "remaining": len(remaining),
+                        "locale": target_locale,
                     }
                 )
             if on_batch_progress:
                 await on_batch_progress(newly, echoed)
+
+        # Anti-spin: if we made zero progress and nothing shrank, break early to micro-batches
+        if attempt_progress == 0 and len(remaining) == before_count:
+            if on_batch_detail:
+                await on_batch_detail(
+                    {"type": "no_progress_break", "attempt": attempt, "remaining": len(remaining), "locale": target_locale}
+                )
+            break
 
     # Final micro-batch pass for anything still remaining
     if remaining:
@@ -756,16 +878,12 @@ async def _translate_items_with_retries(
                 )
                 v = result_map.get(str(item["key"]))
                 if v is None:
-                    # still missing
                     review_items.append(_review_item("missing", k, item["text"]))
                     continue
-
                 v = str(v)
                 if v == item["text"] and not _allow_echo(item["text"], glossary):
-                    # echo needs review
-                    pending_echo[k] = {"key": k, "text": item["text"]}
+                    review_items.append(_review_item("echo", k, item["text"], candidate=item["text"]))
                     continue
-
                 validate_translation_placeholders(item.get("expected") or {}, v)
                 translated[str(item["key"])] = v
                 del remaining[k]
@@ -775,19 +893,14 @@ async def _translate_items_with_retries(
                 review_items.append(_review_item("missing", k, item["text"]))
                 if on_batch_detail:
                     await on_batch_detail(
-                        {"type": "micro_error", "key": k, "error": str(e)[:200], "sample_src": item["text"][:120]}
+                        {"type": "micro_error", "key": k, "error": str(e)[:200], "sample_src": item["text"][:120], "locale": target_locale}
                     )
 
-    # Any unresolved echoes are added to review with the echoed source as candidate
+    # Any unresolved echoes were already removed from remaining; ensure they are reported
     for k, item in pending_echo.items():
         review_items.append(_review_item("echo", k, item["text"], candidate=item["text"]))
 
-    # Any residual remaining are considered missing
-    for k, item in remaining.items():
-        review_items.append(_review_item("missing", k, item["text"]))
-
     return translated, review_items
-
 
 def _fill_catalog_from_map(
     src_catalog: polib.POFile,
@@ -883,7 +996,18 @@ async def translate(
     out_per_locale: Dict[str, polib.POFile] = {}
     for loc in locales_list:
         items, _ = _build_items_for_locale(src_catalog, loc)
-        translated_map = await _translate_items_with_retries(
+
+        # batch logging hooks (info-level)
+        async def _on_progress(newly: int, echoed: int):
+            log.info("translate /locale=%s accepted=%d echoed=%d", loc, newly, echoed)
+
+        async def _on_detail(payload: dict):
+            try:
+                log.info("translate detail /locale=%s %s", loc, json.dumps(payload, ensure_ascii=False)[:2000])
+            except Exception:
+                log.info("translate detail /locale=%s %r", loc, payload)
+
+        translated_map, _review_items = await _translate_items_with_retries(
             provider=provider,
             all_items=items,
             source_lang=sourceLang,
@@ -891,7 +1015,10 @@ async def translate(
             batch_size=s.batch_size,
             system_prompt=s.system_prompt,
             glossary=s.glossary,
+            on_batch_progress=_on_progress,
+            on_batch_detail=_on_detail,
         )
+
         out = _clone_catalog_structure(src_catalog)
         out.metadata["Language"] = loc
         out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
@@ -904,6 +1031,7 @@ async def translate(
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="translations.zip"'},
     )
+
 
 # -----------------------------------------------------------------------------
 # Streaming translate with NDJSON progress + base64 ZIP
@@ -1028,6 +1156,116 @@ async def translate_ndjson(
         yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
+
+# -----------------------------------------------------------------------------
+# Diagnostics: quick test-run (language-agnostic)
+# -----------------------------------------------------------------------------
+@app.post("/diagnostics/test-run")
+async def diagnostics_test_run(
+    po: UploadFile = File(...),
+    locale: str = Form(...),
+    sourceLang: str = Form("en"),
+    sample_size: int = Form(25),
+    settings_json: Optional[str] = Form(None),
+):
+    """
+    Run a quick sample translation and return a compact quality report.
+    It does not write files; it uses the current provider settings as-is.
+    """
+    # parse PO
+    _ensure_po_file(po)
+    try:
+        content = await po.read()
+        src_catalog = polib.pofile(content.decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PO file: {e}")
+
+    s = EFFECTIVE_SETTINGS if not settings_json else Settings(**json.loads(settings_json)).normalized()
+    provider = _provider_from_settings(s)
+
+    all_items, _ = _build_items_for_locale(src_catalog, locale)
+    if not all_items:
+        return JSONResponse({"ok": False, "error": "No translatable items found"})
+
+    # choose a simple, deterministic sample from head/middle/tail when possible
+    n = max(1, min(int(sample_size), len(all_items)))
+    if n <= 5:
+        sample = all_items[:n]
+    else:
+        head = all_items[: n // 3]
+        mid_start = max(0, (len(all_items) // 2) - (n // 6))
+        mid = all_items[mid_start : mid_start + (n // 3)]
+        tail = all_items[-(n - len(head) - len(mid)) :]
+        sample = head + mid + tail
+
+    # Build provider batch with context (if any)
+    provider_batch = []
+    for it in sample:
+        row = {"key": it["key"], "text": it["text"]}
+        if it.get("context"):
+            row["context"] = it["context"]
+        provider_batch.append(row)
+
+    # call provider once
+    try:
+        mapping = await provider.translate_batch(
+            batch=provider_batch,
+            source_lang=sourceLang,
+            target_locale=locale,
+            glossary=s.glossary,
+            system_prompt=s.system_prompt,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Provider error: {e}")
+
+    # evaluate
+    results: List[Dict[str, Any]] = []
+    ok_count = 0
+    echo_count = 0
+    ph_errors = 0
+    missing_count = 0
+
+    for it in sample:
+        k = str(it["key"])
+        src = it["text"]
+        out = mapping.get(k)
+        rec: Dict[str, Any] = {"key": k, "source": src, "translation": out or ""}
+
+        if out is None:
+            rec["status"] = "missing"
+            missing_count += 1
+        else:
+            out = str(out)
+            if out == src and not _allow_echo(src, s.glossary):
+                rec["status"] = "echo"
+                echo_count += 1
+            else:
+                try:
+                    validate_translation_placeholders(it.get("expected_placeholders") or {}, out)
+                    rec["status"] = "ok"
+                    ok_count += 1
+                except ValueError as ve:
+                    rec["status"] = "placeholder_error"
+                    rec["placeholder_error"] = str(ve)
+                    ph_errors += 1
+
+        results.append(rec)
+
+    summary = {
+        "total": len(sample),
+        "ok": ok_count,
+        "echo": echo_count,
+        "placeholder_errors": ph_errors,
+        "missing": missing_count,
+        "provider": s.provider,
+        "model": s.openai_compat.get("model") if s.provider == "openai_compat" else s.ollama.get("model"),
+        "base_url": s.openai_compat.get("base_url") if s.provider == "openai_compat" else s.ollama.get("host"),
+    }
+
+    # Note: for full wire-level visibility of what was sent/returned,
+    # enable provider tracing in settings (openai_compat.trace / ollama.trace).
+    return JSONResponse({"ok": True, "summary": summary, "results": results})
+
 
 from fastapi import Body
 from fastapi.responses import JSONResponse

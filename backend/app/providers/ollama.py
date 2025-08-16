@@ -1,190 +1,184 @@
-# backend/app/providers/ollama.py
-from __future__ import annotations
-
 import json
-import re
+import logging
 from typing import Any, Dict, List, Optional
 
-import aiohttp
+import httpx
+
+logger = logging.getLogger("wepo.providers.ollama")
 
 
-def _extract_json_safely(text: Any) -> Dict[str, Any]:
-    if isinstance(text, dict):
-        return text
-    if not isinstance(text, str):
-        raise ValueError("Provider returned non-string content")
-
-    s = text.strip()
-
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
-    if fence:
-        candidate = fence.group(1)
-        return json.loads(candidate)
-
+def _extract_json_safely(text: str) -> Dict[str, Any]:
     try:
-        return json.loads(s)
+        return json.loads(text)
     except Exception:
         pass
-
-    first = s.find("{")
-    last = s.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        candidate = s[first : last + 1]
-        return json.loads(candidate)
-
-    raise ValueError(f"Provider returned non-JSON. Content snippet: {s[:240]}")
-
-
-def _items_list_to_kv(d: Dict[str, Any]) -> Dict[str, str]:
-    if isinstance(d, dict) and "items" in d and isinstance(d["items"], list):
-        out: Dict[str, str] = {}
-        for it in d["items"]:
-            if not isinstance(it, dict):
-                continue
-            k = str(it.get("key", "")).strip()
-            v = it.get("text", "")
-            if k:
-                out[k] = "" if v is None else str(v)
-        return out
-
-    if isinstance(d, dict):
-        out: Dict[str, str] = {}
-        for k, v in d.items():
-            if isinstance(v, (str, int, float)):
-                out[str(k)] = str(v)
-        if out:
-            return out
-
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return {}
     return {}
 
 
-class OllamaProvider:
-    """
-    Ollama chat provider (local).
-    Defaults to http://localhost:11434 but can be pointed elsewhere.
-    Expects STRICT JSON output identical to OpenAICompatProvider.
-    """
+def _items_list_to_kv(
+    data: Any,
+    expected_keys: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    kv: Dict[str, str] = {}
 
-    def __init__(
-        self,
-        *,
-        model: str,
-        base_url: str = "http://localhost:11434",
-        temperature: float = 0.2,
-        timeout: int = 120,
-        extra_headers: Optional[Dict[str, str]] = None,
-    ) -> None:
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-        self.temperature = float(temperature)
-        self.timeout = int(timeout)
-        self.extra_headers = extra_headers or {}
+    def norm(v: Any) -> str:
+        return "" if v is None else str(v)
+
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        items = data["items"]
+        for it in items:
+            if isinstance(it, dict) and "key" in it and "text" in it:
+                kv[str(it["key"])] = norm(it["text"])
+        if expected_keys and kv and not any(k in expected_keys for k in kv.keys()):
+            if len(items) == len(expected_keys):
+                kv = {str(expected_keys[i]): norm(items[i].get("text")) for i in range(len(items))}
+        return kv
+
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, (str, int, float)) or v is None:
+                kv[str(k)] = norm(v)
+        if kv and expected_keys is not None:
+            kv = {k: v for k, v in kv.items() if k in expected_keys}
+        return kv
+
+    if isinstance(data, list):
+        items = data
+        for it in items:
+            if isinstance(it, dict) and "key" in it and "text" in it:
+                kv[str(it["key"])] = norm(it["text"])
+        if expected_keys and (not kv or not any(k in expected_keys for k in kv.keys())):
+            if len(items) == len(expected_keys):
+                kv = {str(expected_keys[i]): norm(items[i].get("text")) for i in range(len(items))}
+        return kv
+
+    return kv
+
+
+class OllamaProvider:
+    def __init__(self, settings: dict):
+        self.base_url = (settings or {}).get("base_url") or (settings or {}).get("host") or "http://127.0.0.1:11434"
+        self.model = (settings or {}).get("model", "llama3")
+        self.use_json_format = True
+        self.trace = bool((settings or {}).get("trace", False))
+        self.trace_truncate = int((settings or {}).get("trace_truncate", 2000))
+
+    def _t(self, event: str, **fields: Any) -> None:
+        if not self.trace:
+            return
+        trunc = int(self.trace_truncate)
+        payload = {}
+        for k, v in fields.items():
+            if isinstance(v, str) and len(v) > trunc:
+                payload[k] = v[:trunc] + f"... [truncated {len(v)-trunc}]"
+            else:
+                payload[k] = v
+        try:
+            logger.info("ollama %s %s", event, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            logger.info("ollama %s %r", event, payload)
 
     async def translate_batch(
         self,
         *,
-        batch: List[Dict[str, Any]],
+        batch: List[Dict[str, str]],
         source_lang: str,
         target_locale: str,
+        glossary: Optional[str],
         system_prompt: Optional[str] = None,
-        glossary: Optional[str] = None,
-        http_session: Optional[aiohttp.ClientSession] = None,
+        timeout_s: int = 60,
+        http_session: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, str]:
         expected_keys = [str(it["key"]) for it in batch]
 
-        items = []
-        for it in batch:
-            item = {"key": str(it["key"]), "text": str(it["text"])}
-            if it.get("context"):
-                item["context"] = str(it["context"])
-            items.append(item)
-
-        rules = (
-            "Return STRICT JSON only. Do not add commentary. "
-            "Return an object with one field: items. "
-            "items is an array with EXACTLY the same number of elements as you received. "
-            "Each element is an object with fields key and text. "
-            "Use the SAME key values you received. "
-            "Return items in the SAME ORDER as input. "
-            "Preserve placeholders like %s, %d, %1$s, {name}, and keep HTML tags unchanged. "
-            "Do NOT add or remove placeholders. "
-            "If an input item has a 'context' field, use it for disambiguation, but do NOT include it in the output."
-        )
-
         user_payload = {
-            "instructions": rules,
+            "instructions": (
+                "Return STRICT JSON only. Do not add commentary. "
+                "Return an object with one field: items. "
+                "items is an array with EXACTLY the same number of elements as you received. "
+                "Each element is an object with fields key and text. "
+                "Use the SAME key values you received. "
+                "Return items in the SAME ORDER as input. "
+                "Preserve placeholders like %s, %d, %1$s, {name}, and keep HTML tags unchanged. "
+                "Do NOT add or remove placeholders. "
+                "If an input item has a 'context' field, use it for disambiguation, but do NOT include it in the output."
+            ),
             "source_lang": source_lang,
             "target_locale": target_locale,
             "glossary": glossary or "",
-            "items": items,
+            "items": [
+                {"key": str(it["key"]), "text": str(it["text"]), **({"context": it["context"]} if it.get("context") else {})}
+                for it in batch
+            ],
             "keys": expected_keys,
         }
 
-        headers = {"Content-Type": "application/json"}
-        if self.extra_headers:
-            headers.update(self.extra_headers)
-
-        # Ollama chat endpoint
-        url = f"{self.base_url}/api/chat"
+        sys = system_prompt or "You are a professional software translator."
         body = {
             "model": self.model,
-            "stream": False,
-            "options": {"temperature": self.temperature},
             "messages": [
-                {"role": "system", "content": system_prompt or "You translate WordPress strings accurately."},
+                {"role": "system", "content": sys},
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
             ],
+            "stream": False,
         }
+        if self.use_json_format:
+            body["format"] = "json"
 
-        close_session = False
-        if http_session is None:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            http_session = aiohttp.ClientSession(timeout=timeout)
-            close_session = True
+        close_client = False
+        client = http_session
+        if client is None:
+            client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_s)
+            close_client = True
+
+        # trace request
+        self._t(
+            "request",
+            model=self.model,
+            base_url=self.base_url,
+            items=len(user_payload["items"]),
+            preview_user=body["messages"][1]["content"],
+        )
 
         try:
-            async with http_session.post(url, headers=headers, json=body) as resp:
-                payload_text = await resp.text()
-                if resp.status >= 400:
-                    raise ValueError(f"HTTP {resp.status}: {payload_text[:240]}")
-                try:
-                    data = json.loads(payload_text)
-                except json.JSONDecodeError:
-                    # Some Ollama builds return raw content; normalize
-                    data = {"message": {"content": payload_text}}
+            r = await client.post("/api/chat", json=body)
+            raw = r.text
+            # trace response
+            self._t("response", status=r.status_code, preview_raw=raw)
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}: {raw[:500]}")
         finally:
-            if close_session:
-                await http_session.close()
+            if close_client:
+                await client.aclose()
 
-        # Extract assistant content from Ollama
-        content = ""
-        if isinstance(data, dict):
-            # Newer Ollama chat API:
-            #   {"message":{"role":"assistant","content":"..."}, "done": true}
-            if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
-                content = data["message"]["content"]
-            # Older generate API compatibility:
-            elif "response" in data and isinstance(data["response"], str):
-                content = data["response"]
-            else:
-                content = json.dumps(data)
-        else:
-            content = str(data)
+        try:
+            outer = json.loads(raw)
+            content = outer.get("message", {}).get("content", "")
+            parsed = _extract_json_safely(content)
+        except Exception:
+            parsed = _extract_json_safely(raw)
 
-        parsed = _extract_json_safely(content)
-        mapping = _items_list_to_kv(parsed)
+        if isinstance(parsed, dict) and {"instructions", "source_lang", "target_locale"}.issubset(set(parsed.keys())):
+            parsed = {"items": parsed.get("items", [])}
 
-        if not mapping:
-            # last-chance parser
-            try:
-                maybe_map = json.loads(content)
-                if isinstance(maybe_map, dict):
-                    mapping = {str(k): str(v) for k, v in maybe_map.items() if isinstance(v, (str, int, float))}
-            except Exception:
-                pass
+        mapping = _items_list_to_kv(parsed, expected_keys=expected_keys)
+        if mapping and expected_keys:
+            mapping = {k: v for k, v in mapping.items() if k in expected_keys}
+
+        # trace mapping sample
+        sample = list(mapping.items())[:3]
+        self._t("parsed_mapping", count=len(mapping), sample=json.dumps(sample, ensure_ascii=False))
 
         return mapping
 
-# --- public aliases for external imports ---
+
+# public aliases so other modules can import for diagnostics
 extract_json_safely = _extract_json_safely
 items_list_to_kv = _items_list_to_kv
