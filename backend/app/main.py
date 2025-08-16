@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import tempfile
+from app.analyzers.po_lint import analyze_po
 import zipfile
 from typing import Dict, List, Tuple, Optional, Iterable, Callable, Awaitable
 
@@ -231,6 +232,56 @@ async def ollama_models():
         models = []
     return {"ok": True, "models": models}
 
+@app.post("/analyze")
+async def analyze_endpoint(
+    po: UploadFile = File(...),
+):
+    try:
+        content = await po.read()
+        src = polib.pofile(content.decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid PO file: {e}")
+
+    report = analyze_po(src, locale=None, filename=po.filename)
+    return JSONResponse(report)
+
+
+@app.post("/analyze/apply")
+async def analyze_apply_endpoint(
+    po: UploadFile = File(...),
+    fixes_json: str = Form("[]"),  # array of {index, key, kind, text}
+):
+    """
+    Apply safe auto-fixes to a PO and return the updated PO as base64.
+    'kind' must be 'replace_msgstr' or 'replace_plural_i'.
+    """
+    try:
+        content = await po.read()
+        src = polib.pofile(content.decode("utf-8", errors="replace"))
+        fixes = json.loads(fixes_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad request: {e}")
+
+    for f in fixes:
+        idx = int(f["index"])
+        kind = f["kind"]
+        text = f["text"]
+        if kind == "replace_msgstr":
+            src[idx].msgstr = text
+        elif kind == "replace_plural_i":
+            key = str(f.get("key", ""))
+            if "|p" in key:
+                try:
+                    p = int(key.split("|p", 1)[1])
+                    src[idx].msgstr_plural[p] = text
+                except Exception:
+                    continue  # ignore malformed plural index
+
+    out_bytes = src.__unicode__().encode("utf-8")
+    b64 = base64.b64encode(out_bytes).decode("ascii")
+    return JSONResponse({"poBase64": b64})
+
+
 @app.post("/providers/verify")
 async def verify_provider(payload: Settings):
     s = payload.normalized()
@@ -382,6 +433,7 @@ def _build_items_for_locale(
     return items, reverse
 
 
+# Hardened retry logic with micro-batch last pass and review list (no blind echoes).
 async def _translate_items_with_retries(
     provider,
     all_items: List[dict],
@@ -391,29 +443,40 @@ async def _translate_items_with_retries(
     system_prompt: str,
     glossary: str,
     on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
-) -> Dict[str, str]:
+    on_batch_detail: Optional[Callable[[dict], Awaitable[None]]] = None,  # detail logger
+) -> Tuple[Dict[str, str], List[dict]]:
     """
     Sends items in batches; retries missing/echoed-only items up to MAX_RETRIES.
     On the final attempt:
       - drop to micro-batches (size=1) for any stragglers
-      - then auto-fill echo-safe items (numbers/URLs/pure symbols or exact glossary terms)
+      - accept echo-safe items (numbers/URLs/pure symbols or exact glossary terms)
+    Remaining items are returned for user review with reason = "echo" or "missing".
     """
     # Clamp to safe range
     batch_size = max(10, min(300, int(batch_size or 40)))
 
-    remaining: Dict[str, dict] = {it["key"]: it for it in all_items}
+    remaining: Dict[str, dict] = {str(it["key"]): {"key": str(it["key"]), "text": it["text"]} for it in all_items}
     translated: Dict[str, str] = {}
+    pending_echo: Dict[str, dict] = {}  # key -> {key, text}
 
     def make_batches(values: Iterable[dict], size: int) -> List[List[dict]]:
         data = list(values)
         return [data[i : i + size] for i in range(0, len(data), size)]
+
+    async def emit_detail(payload: dict):
+        if on_batch_detail:
+            try:
+                await on_batch_detail(payload)
+            except Exception:
+                pass  # never break work due to logging
 
     # Normal retry passes
     for attempt in range(1, MAX_RETRIES + 1):
         if not remaining:
             break
 
-        for batch in make_batches(list(remaining.values()), batch_size):
+        batches = make_batches(list(remaining.values()), batch_size)
+        for b_index, batch in enumerate(batches, start=1):
             try:
                 result = await provider.translate_batch(
                     batch=batch,
@@ -429,22 +492,43 @@ async def _translate_items_with_retries(
                 raise HTTPException(status_code=400, detail="Provider error: invalid batch result")
 
             newly, echoed = 0, 0
-            for k, v in result.items():
-                if k not in remaining:
+            missing_keys: List[str] = []
+            # Evaluate every item in the original batch to catch omitted keys
+            for item in batch:
+                k = str(item["key"])
+                v = result.get(k)
+                if v is None:
+                    missing_keys.append(k)
                     continue
-                src_text = remaining[k]["text"]
-                # If model echoed exactly and echo is not allowed, count as echoed
+                src_text = item["text"]
+                v = str(v)
                 if v == src_text and not _allow_echo(src_text, glossary):
                     echoed += 1
+                    pending_echo[k] = {"key": k, "text": src_text}
                     continue
                 translated[k] = v
-                del remaining[k]
+                if k in remaining:
+                    del remaining[k]
+                if k in pending_echo:
+                    pending_echo.pop(k, None)
                 newly += 1
 
             if on_batch_progress and (newly > 0 or echoed > 0):
                 await on_batch_progress(newly, echoed)
 
-    # Last-chance micro-batch pass for any stragglers
+            await emit_detail({
+                "type": "batch",
+                "attempt": attempt,
+                "batch_index": b_index,
+                "batch_size": len(batch),
+                "returned": len(result),
+                "accepted": newly,
+                "echoed": echoed,
+                "missing_sample": missing_keys[:5],
+                "missing_count": len(missing_keys),
+            })
+
+    # Last-chance micro-batch pass for any stragglers (helps local models that drop keys)
     if remaining:
         for k in list(remaining.keys()):
             item = remaining[k]
@@ -457,21 +541,28 @@ async def _translate_items_with_retries(
                     glossary=glossary,
                 )
             except Exception:
+                await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "provider_error"})
                 continue
 
             v = (result or {}).get(k)
             if v is not None:
                 src_text = item["text"]
+                v = str(v)
                 if v == src_text and not _allow_echo(src_text, glossary):
-                    # reject non-allowed echo
-                    pass
+                    await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "echo_rejected"})
+                    pending_echo[k] = {"key": k, "text": src_text}
                 else:
                     translated[k] = v
                     del remaining[k]
+                    if k in pending_echo:
+                        pending_echo.pop(k, None)
                     if on_batch_progress:
                         await on_batch_progress(1, 0)
+                    await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "accepted"})
+            else:
+                await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "missing_return"})
 
-    # Echo-safe fallback to avoid failing the whole job for numbers and similar strings
+    # Echo-safe fallback (numbers/URLs/symbols/etc.) — auto-accept
     if remaining:
         autofilled = 0
         for k in list(remaining.keys()):
@@ -479,18 +570,23 @@ async def _translate_items_with_retries(
             if _allow_echo(src_text, glossary):
                 translated[k] = src_text
                 del remaining[k]
+                pending_echo.pop(k, None)
                 autofilled += 1
         if autofilled and on_batch_progress:
             await on_batch_progress(autofilled, 0)
+        if autofilled:
+            await emit_detail({"type": "fallback", "mode": "echo_safe", "autofilled": autofilled})
 
-    if remaining:
-        first_missing = next(iter(remaining.keys()))
-        raise HTTPException(
-            status_code=400,
-            detail=f"Missing translation for {first_missing} ({target_locale}). The provider did not return all items.",
-        )
+    # Build review list for anything unresolved
+    review: List[dict] = []
+    for k in list(remaining.keys()):
+        review.append({"key": k, "source": remaining[k]["text"], "candidate": None, "reason": "missing"})
+        del remaining[k]
 
-    return translated
+    for k, item in list(pending_echo.items()):
+        review.append({"key": k, "source": item["text"], "candidate": item["text"], "reason": "echo"})
+
+    return translated, review
 
 
 def _fill_catalog_from_map(
@@ -498,43 +594,68 @@ def _fill_catalog_from_map(
     out_catalog: polib.POFile,
     translated_map: Dict[str, str],
     target_locale: str,
-):
+    *,
+    strict: bool = True,
+) -> None:
+    """
+    Copy translations from translated_map into out_catalog.
+
+    strict=True  -> raise on missing keys or placeholder errors (used for fully-automatic runs)
+    strict=False -> skip missing/invalid entries and leave them untranslated (used for finalize after review)
+    """
     npl = nplurals_for_locale(target_locale)
+
     for idx, e in enumerate(src_catalog):
         expected = extract_all_placeholders_from_entry(e)
+
         if e.msgid_plural:
             out_catalog[idx].msgstr_plural = {}
             for f in range(npl):
                 key = f"{idx}|p{f}"
                 t = translated_map.get(key)
+
                 if t is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Missing translation for {key} ({target_locale}). The provider did not return all plural forms.",
-                    )
+                    if strict:
+                        raise HTTPException(status_code=400, detail=f"Missing translation for {key} ({target_locale}).")
+                    # lenient: leave this plural form empty/untranslated
+                    continue
+
                 try:
                     validate_translation_placeholders(expected, t)
                 except ValueError as ve:
+                    if strict:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Placeholder error in {key} ({target_locale}): {ve}",
+                        )
+                    # lenient: skip invalid text, keep untranslated
+                    continue
+
+                out_catalog[idx].msgstr_plural[f] = t
+
+        else:
+            key = f"{idx}"
+            t = translated_map.get(key)
+
+            if t is None:
+                if strict:
+                    raise HTTPException(status_code=400, detail=f"Missing translation for {key} ({target_locale}).")
+                # lenient: leave msgstr empty
+                continue
+
+            try:
+                validate_translation_placeholders(expected, t)
+            except ValueError as ve:
+                if strict:
                     raise HTTPException(
                         status_code=400,
                         detail=f"Placeholder error in {key} ({target_locale}): {ve}",
                     )
-                out_catalog[idx].msgstr_plural[f] = t
-        else:
-            key = f"{idx}"
-            t = translated_map.get(key)
-            if t is None:
-                raise HTTPException(
-                    status_code=400, detail=f"Missing translation for {key} ({target_locale})."
-                )
-            try:
-                validate_translation_placeholders(expected, t)
-            except ValueError as ve:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Placeholder error in {key} ({target_locale}): {ve}",
-                )
+                # lenient: skip invalid text
+                continue
+
             out_catalog[idx].msgstr = t
+
 
 # -----------------------------------------------------------------------------
 # Non-streaming translate -> returns a ZIP
@@ -596,8 +717,8 @@ async def translate_ndjson(
 ):
     _ensure_po_file(po)
     try:
-        content = await po.read()
-        src_catalog = polib.pofile(content.decode("utf-8", errors="replace"))
+        raw_bytes = await po.read()
+        src_catalog = polib.pofile(raw_bytes.decode("utf-8", errors="replace"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid PO file: {e}")
 
@@ -615,7 +736,10 @@ async def translate_ndjson(
         # Tell the UI how many strings in total we expect
         yield json.dumps({"type": "meta", "total": grand_total}) + "\n"
 
-        produced: Dict[str, polib.POFile] = {}
+        # Collect results for possible finalize step
+        translated_by_locale: Dict[str, Dict[str, str]] = {}
+        review_by_locale: Dict[str, List[dict]] = {}
+
         overall_done = 0
         overall_echoed = 0
 
@@ -628,12 +752,17 @@ async def translate_ndjson(
                 overall_echoed += echoed
                 await progress_q.put(
                     json.dumps(
-                        {"type": "progress", "done": overall_done, "total": grand_total, "echoed": overall_echoed}
+                        {"type": "progress", "locale": loc, "done": overall_done, "total": grand_total, "echoed": overall_echoed}
                     )
                     + "\n"
                 )
 
-            async def run_locale() -> Dict[str, str]:
+            async def on_detail(payload: dict):
+                payload = dict(payload)
+                payload["locale"] = loc
+                await progress_q.put(json.dumps(payload) + "\n")
+
+            async def run_locale() -> Tuple[Dict[str, str], List[dict]]:
                 all_items_for_locale, _ = _build_items_for_locale(src_catalog, loc)
                 return await _translate_items_with_retries(
                     provider=provider,
@@ -644,6 +773,7 @@ async def translate_ndjson(
                     system_prompt=s.system_prompt,
                     glossary=s.glossary,
                     on_batch_progress=on_progress,
+                    on_batch_detail=on_detail,
                 )
 
             task = asyncio.create_task(run_locale())
@@ -656,33 +786,140 @@ async def translate_ndjson(
                     line = await asyncio.wait_for(progress_q.get(), timeout=10.0)
                     yield line
                 except asyncio.TimeoutError:
-                    yield json.dumps({"type": "heartbeat"}) + "\n"
+                    yield json.dumps({"type": "heartbeat", "locale": loc}) + "\n"
 
-            # Send any provider error immediately
+            # End-of-locale result
             try:
-                translated_map = task.result()
+                translated_map, review_items = task.result()
             except HTTPException as he:
-                yield json.dumps({"type": "error", "message": he.detail}) + "\n"
+                yield json.dumps({"type": "error", "message": he.detail, "locale": loc}) + "\n"
                 return
             except Exception as e:
-                yield json.dumps({"type": "error", "message": f"Provider error: {e}"}) + "\n"
+                yield json.dumps({"type": "error", "message": f"Provider error: {e}", "locale": loc}) + "\n"
                 return
 
-            # Build the locale's PO using the translations we collected
+            translated_by_locale[loc] = translated_map
+            if review_items:
+                review_by_locale[loc] = review_items
+
+        # If anything needs review, emit a single review packet and finish
+        total_review = sum(len(v) for v in review_by_locale.values())
+        if total_review > 0:
+            job = {
+                "srcPoB64": base64.b64encode(raw_bytes).decode("ascii"),
+                "locales": locales_list,
+                "translated": translated_by_locale,
+                "review": review_by_locale,
+            }
+            yield json.dumps({"type": "review", "total": total_review, "job": job}) + "\n"
+            return
+
+        # Otherwise build the final ZIP immediately and send as done
+        produced: Dict[str, polib.POFile] = {}
+        for loc in locales_list:
             out = _clone_catalog_structure(src_catalog)
             out.metadata["Language"] = loc
             out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
-            _fill_catalog_from_map(src_catalog, out, translated_map, loc)
+            _fill_catalog_from_map(src_catalog, out, translated_by_locale.get(loc, {}), loc)
             produced[loc] = out
 
-        # Package all locales into a ZIP and send it as the final event
         zip_bytes = _build_zip_bytes(produced)
         b64 = base64.b64encode(zip_bytes).decode("ascii")
         yield json.dumps({"type": "done", "zipBase64": b64}) + "\n"
 
     return StreamingResponse(generator(), media_type="application/x-ndjson")
 
+from fastapi import Body
+from fastapi.responses import JSONResponse
 
+def _key_to_source_map(po: polib.POFile) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for e in po:
+        if e.obsolete:
+            continue
+        key = (e.msgctxt + "|" if e.msgctxt else "") + e.msgid
+        m[key] = e.msgid
+        if e.msgid_plural:
+            # plural forms are handled in _build_items_for_locale, so key will include |p{index}
+            pass
+    return m
+
+@app.post("/translate/finalize")
+async def translate_finalize(payload: dict = Body(...)):
+    """
+    Finalize a translation job after user review.
+
+    Expected payload:
+    {
+      "job": {
+        "srcPoB64": str,
+        "locales": [str],
+        "translated": { "<loc>": { "<key>": "<text>", ... }, ... },
+        "review": { "<loc>": [ { "key": "...", "source": "...", "candidate": "...", "reason": "echo"|"missing" }, ... ] }
+      },
+      "decisions": { "<loc>": [ { "key": "...", "action": "accept"|"reject"|"edit", "text": "<edited text optional>" }, ... ] }
+    }
+    """
+    try:
+        job = payload.get("job") or {}
+        decisions = payload.get("decisions") or {}
+        src_b64 = job["srcPoB64"]
+        locales_list = job["locales"]
+        translated_by_locale: Dict[str, Dict[str, str]] = job.get("translated", {})
+        review_by_locale: Dict[str, List[dict]] = job.get("review", {})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid finalize payload")
+
+    # Load source PO
+    try:
+        src_bytes = base64.b64decode(src_b64)
+        src_catalog = polib.pofile(src_bytes.decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid srcPoB64: {e}")
+
+    produced: Dict[str, polib.POFile] = {}
+
+    for loc in locales_list:
+        # start with whatever we already translated automatically
+        base_map: Dict[str, str] = dict(translated_by_locale.get(loc, {}))
+
+        # fast lookup of review items by key for this locale
+        review_lookup: Dict[str, dict] = {ri["key"]: ri for ri in review_by_locale.get(loc, []) if "key" in ri}
+
+        # apply user decisions
+        for d in decisions.get(loc, []):
+            key = str(d.get("key") or "")
+            action = d.get("action")
+            if not key or not action:
+                continue
+
+            if action == "accept":
+                # Accept echo -> prefer candidate if present else the source shown in the review
+                ri = review_lookup.get(key)
+                if ri:
+                    text = ri.get("candidate") or ri.get("source")
+                    if isinstance(text, str):
+                        base_map[key] = text
+
+            elif action == "edit":
+                text = d.get("text")
+                if isinstance(text, str) and text.strip() != "":
+                    base_map[key] = text
+
+            elif action == "reject":
+                # leave untranslated
+                pass
+
+        # build output catalog, but leniently (skip any missing/invalid without raising)
+        out = _clone_catalog_structure(src_catalog)
+        out.metadata["Language"] = loc
+        out.metadata["Plural-Forms"] = get_plural_forms_header(loc)
+        _fill_catalog_from_map(src_catalog, out, base_map, loc, strict=False)
+        produced[loc] = out
+
+    zip_bytes = _build_zip_bytes(produced)
+    b64 = base64.b64encode(zip_bytes).decode("ascii")
+    return JSONResponse({"zipBase64": b64})
 
 # -----------------------------------------------------------------------------
 # Debug helpers

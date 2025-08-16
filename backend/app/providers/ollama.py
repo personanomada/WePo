@@ -73,13 +73,14 @@ class OllamaProvider:
         if len(batch) > 300:
             raise ValueError("Batch too large (>300)")
 
+        expected_keys: List[str] = [str(it["key"]) for it in batch]
         payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
         rules = (
             "Return STRICT JSON only. Do not add commentary. "
-            "Output an object with exactly one field: items. "
-            "items is an array of objects with the SAME keys you received. "
-            "Every input key MUST appear exactly once in items. "
-            "Never invent keys. Preserve placeholder tokens and HTML tags."
+            "Return an object with one field: items. "
+            "items is an array with EXACTLY the same number of elements as you received. "
+            "Each element is {key,text}. Use the SAME key values you received. "
+            "Return items in the SAME ORDER as input. Preserve placeholders and HTML tags."
         )
         body = {
             "model": self.model,
@@ -94,6 +95,7 @@ class OllamaProvider:
                             "target_locale": target_locale,
                             "glossary": glossary or "",
                             "items": payload_items,
+                            "keys": expected_keys,
                         },
                         ensure_ascii=False,
                     ),
@@ -136,13 +138,33 @@ class OllamaProvider:
         if not isinstance(items, list):
             raise ValueError("JSON missing 'items' array")
 
+        # Build output with the same key-rescue strategy
         out: Dict[str, str] = {}
+        returned_keys = [str(it.get("key")) for it in items if isinstance(it, dict)]
+        dbg_record({"provider": "ollama", "dir": "parsed", "count": len(items), "keys_sample": returned_keys[:5]})
+
         for it in items:
+            if not isinstance(it, dict):
+                continue
             k = it.get("key")
             v = it.get("text")
             if k is None or v is None:
-                raise ValueError("Each item must have 'key' and 'text'")
-            out[str(k)] = str(v)
+                continue
+            k = str(k)
+            if k in expected_keys:
+                out[k] = str(v)
 
-        dbg_record({"provider": "ollama", "dir": "parsed", "count": len(out)})
+        if len(out) < len(items) and len(items) == len(expected_keys):
+            remapped = 0
+            for idx, it in enumerate(items):
+                v = it.get("text")
+                if v is None:
+                    continue
+                key_for_position = expected_keys[idx]
+                if key_for_position not in out:
+                    out[key_for_position] = str(v)
+                    remapped += 1
+            if remapped:
+                dbg_record({"provider": "ollama", "dir": "remap_by_position", "remapped": remapped})
+
         return out

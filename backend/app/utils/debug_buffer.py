@@ -1,34 +1,24 @@
-# backend/app/utils/debug_buffer.py
 from __future__ import annotations
-
 from collections import deque
-from datetime import datetime
-from threading import Lock
-from typing import Any, Deque, Dict, List
+from typing import Any, Dict, List
 
-# Simple in-memory ring buffer for recent provider I/O
-_MAX = 200  # keep last 200 entries
-_buf: Deque[Dict[str, Any]] = deque(maxlen=_MAX)
-_lock = Lock()
+# Keep the last 50 entries
+_BUF: deque = deque(maxlen=50)
 
-
-def push(item: Dict[str, Any]) -> None:
+def record(entry: Dict[str, Any]) -> None:
     """
-    Append a debug item to the ring buffer.
-    The item can be any dict (raw text, parsed json, errors, etc).
+    Append a compact, JSON-serializable snapshot.
+    Callers should avoid secrets and truncate large blobs before passing them.
     """
-    with _lock:
-        _buf.appendleft(
-            {
-                "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                **item,
-            }
-        )
-
+    try:
+        _BUF.append(entry)
+    except Exception:
+        # Never break functional code because of debug logging
+        pass
 
 def recent(n: int = 5) -> List[Dict[str, Any]]:
-    """Return the most recent n items (default 5)."""
-    if n <= 0:
-        return []
-    with _lock:
-        return list(list(_buf)[: min(n, len(_buf))])
+    """
+    Return the most recent n snapshots, newest last.
+    """
+    n = max(1, min(int(n or 5), len(_BUF)))
+    return list(_BUF)[-n:]

@@ -26,10 +26,14 @@ def extract_json_safely(content: str) -> dict:
     return json.loads(content[start : end + 1])
 
 
-def _json_schema_format() -> dict:
+def _json_schema_for_keys(keys: List[str]) -> dict:
     """
-    JSON Schema to force an object with 'items' array containing {key, text}.
-    This matches LM Studio's requirement: response_format.type = 'json_schema'.
+    JSON Schema to force:
+      - top-level object with 'items'
+      - items is an array with EXACTLY len(keys) elements
+      - each element is {key,text} where key ∈ keys
+      - unique keys
+    LM Studio accepts response_format.type = 'json_schema'.
     """
     return {
         "type": "json_schema",
@@ -42,12 +46,15 @@ def _json_schema_format() -> dict:
                 "properties": {
                     "items": {
                         "type": "array",
+                        "minItems": len(keys),
+                        "maxItems": len(keys),
+                        "uniqueItems": True,
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
                             "required": ["key", "text"],
                             "properties": {
-                                "key": {"type": "string"},
+                                "key": {"type": "string", "enum": keys},
                                 "text": {"type": "string"},
                             },
                         },
@@ -125,29 +132,35 @@ class OpenAICompatProvider:
         if len(batch) > 300:
             raise ValueError("Batch too large (>300)")
 
+        # Stable keys for this batch (global indices or ctx|id)
+        expected_keys: List[str] = [str(it["key"]) for it in batch]
         payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
+
         rules = (
             "Return STRICT JSON only. Do not add commentary. "
-            "Output an object with exactly one field: items. "
-            "items is an array of objects with the SAME keys you received. "
-            "Every input key MUST appear exactly once in items. "
-            "Never invent keys. Preserve placeholder tokens and HTML tags."
+            "Return an object with one field: items. "
+            "items is an array with EXACTLY the same number of elements as you received. "
+            "Each element is {key,text}. Use the SAME key values you received. "
+            "Preserve placeholders like %s, {name}, and HTML tags."
         )
 
         base_body = {
             "model": self.model,
             "temperature": self.temperature,
+            # many local servers accept max_tokens to allow long outputs
+            "max_tokens": 2048,
             "messages": [
                 {"role": "system", "content": system_prompt or "You translate WordPress strings. " + rules},
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "instructions": rules,
+                            "instructions": rules + " Return items in the SAME ORDER as input.",
                             "source_lang": source_lang,
                             "target_locale": target_locale,
                             "glossary": glossary or "",
                             "items": payload_items,
+                            "keys": expected_keys,  # redundancy helps the model
                         },
                         ensure_ascii=False,
                     ),
@@ -160,9 +173,9 @@ class OpenAICompatProvider:
         dbg_record({"provider": "openai_compat", "dir": "request", "n": len(payload_items), "model": self.model})
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            # Try JSON Schema mode first
+            # Try JSON Schema with exact keys
             body = dict(base_body)
-            body["response_format"] = _json_schema_format()
+            body["response_format"] = _json_schema_for_keys(expected_keys)
             try:
                 r = await client.post(url, headers=self.headers, json=body)
             except httpx.ReadTimeout as e:
@@ -174,11 +187,12 @@ class OpenAICompatProvider:
 
             # Fallback to text mode if the server rejects json_schema
             if r.status_code == 400:
-                # LM Studio returns a JSON error body. Keep it visible if fallback also fails.
                 schema_err_snippet = r.text[:200]
                 r = await client.post(url, headers=self.headers, json=base_body)
                 if r.status_code >= 400:
-                    raise ValueError(f"Provider HTTP 400 with schema, then HTTP {r.status_code}: {r.text[:300]} | First error: {schema_err_snippet}")
+                    raise ValueError(
+                        f"Provider HTTP 400 with schema, then HTTP {r.status_code}: {r.text[:300]} | First error: {schema_err_snippet}"
+                    )
 
         if r.status_code >= 400:
             raise ValueError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
@@ -189,7 +203,6 @@ class OpenAICompatProvider:
         try:
             content = data["choices"][0]["message"]["content"]
         except Exception:
-            # Some servers use 'text' instead
             content = data.get("choices", [{}])[0].get("text") or data.get("response")
 
         if not isinstance(content, str) or not content.strip():
@@ -197,7 +210,7 @@ class OpenAICompatProvider:
 
         dbg_record({"provider": "openai_compat", "dir": "response", "snippet": content[:200]})
 
-        # Parse JSON. If the model wrapped JSON in {"response": "..."} then unwrap and parse that string.
+        # Parse JSON; unwrap {"response":"..."} if necessary
         try:
             obj = extract_json_safely(content)
             unwrap_guard = 0
@@ -211,13 +224,38 @@ class OpenAICompatProvider:
         if not isinstance(items, list):
             raise ValueError("JSON missing 'items' array")
 
+        # Build output map with two fallbacks:
+        #  1) prefer exact keys as returned (if they match expected_keys)
+        #  2) if keys are wrong but lengths match, remap by position
         out: Dict[str, str] = {}
+
+        returned_keys = [str(it.get("key")) for it in items if isinstance(it, dict)]
+        dbg_record({"provider": "openai_compat", "dir": "parsed", "count": len(items), "keys_sample": returned_keys[:5]})
+
+        # Case A: accept any correctly keyed subset
         for it in items:
+            if not isinstance(it, dict):
+                continue
             k = it.get("key")
             v = it.get("text")
             if k is None or v is None:
-                raise ValueError("Each item must have 'key' and 'text'")
-            out[str(k)] = str(v)
+                continue
+            k = str(k)
+            if k in expected_keys:
+                out[k] = str(v)
 
-        dbg_record({"provider": "openai_compat", "dir": "parsed", "count": len(out)})
+        # Case B: lengths match but keys are wrong or repeated -> remap by position
+        if len(out) < len(items) and len(items) == len(expected_keys):
+            remapped = 0
+            for idx, it in enumerate(items):
+                v = it.get("text")
+                if v is None:
+                    continue
+                key_for_position = expected_keys[idx]
+                if key_for_position not in out:
+                    out[key_for_position] = str(v)
+                    remapped += 1
+            if remapped:
+                dbg_record({"provider": "openai_compat", "dir": "remap_by_position", "remapped": remapped})
+
         return out
