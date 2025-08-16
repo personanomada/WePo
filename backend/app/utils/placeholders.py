@@ -1,7 +1,6 @@
 import re
 from collections import Counter
 from typing import Dict, List
-
 import polib
 
 # 1) printf style
@@ -63,11 +62,36 @@ def validate_translation_placeholders(expected: Dict[str, Counter], translated: 
         "brace": Counter(extract_braces(translated)),
         "html": Counter(extract_html_tags(translated)),
     }
-    for cls in ("printf", "brace", "html"):
-        exp_c = expected.get(cls, {})
-        for token, cnt in exp_c.items():
-            if found[cls].get(token, 0) < cnt:
-                raise ValueError(f"Missing {cls} token '{token}'")
+    # Normalize numeric placeholders for printf (e.g., %1$s -> %s)
+    def _normalize_printf(token: str) -> str:
+        return re.sub(r"%\d+\$", "%", token)
+    exp_printf = Counter()
+    for token, cnt in expected.get("printf", Counter()).items():
+        exp_printf[_normalize_printf(token)] += cnt
+    found_printf = Counter()
+    for token, cnt in found["printf"].items():
+        found_printf[_normalize_printf(token)] += cnt
+    # Check for missing or extra printf tokens
+    for token, cnt in exp_printf.items():
+        if found_printf.get(token, 0) < cnt:
+            raise ValueError(f"Missing printf token '{token}'")
+    for token, cnt in found_printf.items():
+        if cnt > exp_printf.get(token, 0):
+            raise ValueError(f"Extra printf token '{token}'")
+    # Check for missing or extra brace tokens
+    for token, cnt in expected.get("brace", Counter()).items():
+        if found["brace"].get(token, 0) < cnt:
+            raise ValueError(f"Missing brace token '{token}'")
+    for token, cnt in found["brace"].items():
+        if cnt > expected.get("brace", Counter()).get(token, 0):
+            raise ValueError(f"Extra brace token '{token}'")
+    # Check for missing or extra HTML tags
+    for token, cnt in expected.get("html", Counter()).items():
+        if found["html"].get(token, 0) < cnt:
+            raise ValueError(f"Missing html token '{token}'")
+    for token, cnt in found["html"].items():
+        if cnt > expected.get("html", Counter()).get(token, 0):
+            raise ValueError(f"Extra html token '{token}'")
 
 
 def extract_samples_from_catalog(catalog: polib.POFile) -> List[str]:

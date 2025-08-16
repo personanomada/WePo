@@ -28,6 +28,7 @@ from .schemas import AnalyzeOut, Settings, SettingsOut
 from .utils.audit import audit_po
 from .utils.logging_config import setup_logging
 from .utils.placeholders import (
+    extract_all_placeholders,               # NEW: import to get placeholders for singular/plural separately
     extract_all_placeholders_from_entry,
     extract_samples_from_catalog,
     validate_translation_placeholders,
@@ -114,12 +115,126 @@ def _ensure_po_file(file: UploadFile) -> None:
     if not file.filename or not file.filename.lower().endswith(".po"):
         raise HTTPException(status_code=400, detail="Only .po files are accepted")
 
-def _provider_from_settings(s: Settings):
-    if s.provider == "openai_compat":
-        return OpenAICompatProvider(s)
-    if s.provider == "ollama":
-        return OllamaProvider(s)
-    raise HTTPException(status_code=400, detail="Unsupported provider")
+def _coerce_headers(raw: Any) -> Dict[str, str]:
+    """
+    Accept dict or a list of {key,value} pairs from UI, return a flat str->str dict.
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for (k, v) in raw.items()}
+    if isinstance(raw, list):
+        out: Dict[str, str] = {}
+        for item in raw:
+            if isinstance(item, dict) and item.get("key"):
+                out[str(item["key"])] = str(item.get("value", ""))
+        return out
+    return {}
+
+def _provider_from_settings(s: Any):
+    """
+    Build a provider instance from request settings.
+
+    Accepts either:
+      • a Settings object (preferred), with nested provider configs under .openai_compat / .ollama
+      • a plain dict, either full Settings-shaped or provider-scoped
+        e.g. {"provider":"openai_compat","openai_compat":{...}} or {"type":"ollama","model":"...","base_url":"..."}
+    """
+    # Helper to flatten headers from various shapes
+    def _headers_from(obj: Dict[str, Any]) -> Dict[str, str]:
+        return _coerce_headers(obj.get("headers") or obj.get("extra_headers"))
+
+    # If we received a Settings object, branch by its .provider and nested config
+    if hasattr(s, "provider"):
+        provider = (getattr(s, "provider", None) or "openai_compat").lower()
+
+        if provider in ("openai", "openrouter", "openai_compat", "openai-compat"):
+            cfg: Dict[str, Any] = dict(getattr(s, "openai_compat", {}) or {})
+            model = cfg.get("model")
+            if not model:
+                raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+            base_url = cfg.get("base_url") or cfg.get("baseUrl")
+            if not base_url:
+                base_url = (
+                    "https://api.openai.com/v1"
+                    if provider in ("openai", "openai_compat", "openai-compat")
+                    else "https://openrouter.ai/api/v1"
+                )
+
+            return OpenAICompatProvider(
+                model=model,
+                api_key=cfg.get("api_key") or cfg.get("apiKey"),
+                base_url=base_url,
+                temperature=float(cfg.get("temperature", 0.2)),
+                timeout=int(cfg.get("timeout", 60)),
+                extra_headers=_headers_from(cfg),
+            )
+
+        if provider in ("ollama", "local"):
+            cfg: Dict[str, Any] = dict(getattr(s, "ollama", {}) or {})
+            model = cfg.get("model")
+            if not model:
+                raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+            base_url = cfg.get("base_url") or cfg.get("baseUrl") or cfg.get("host") or "http://localhost:11434"
+            return OllamaProvider(
+                model=model,
+                base_url=base_url,
+                temperature=float(cfg.get("temperature", 0.2)),
+                timeout=int(cfg.get("timeout", 120)),
+                extra_headers=_headers_from(cfg),
+            )
+
+        raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
+
+    # Otherwise, try to treat it as a dict (legacy / direct POST from UI)
+    if not isinstance(s, dict):
+        raise HTTPException(status_code=400, detail="provider settings must be an object")
+
+    provider = (s.get("provider") or s.get("type") or "openai_compat").lower()
+    temperature = float(s.get("temperature", 0.2))
+    timeout = int(s.get("timeout") or 60)
+    headers = _coerce_headers(s.get("headers") or s.get("extra_headers"))
+
+    if provider in ("openai", "openrouter", "openai_compat", "openai-compat"):
+        model = s.get("model") or s.get("model_name")
+        if not model:
+            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+        api_key = s.get("api_key") or s.get("apiKey")
+        base_url = s.get("base_url") or s.get("baseUrl")
+        if not base_url:
+            base_url = (
+                "https://api.openai.com/v1"
+                if provider in ("openai", "openai_compat", "openai-compat")
+                else "https://openrouter.ai/api/v1"
+            )
+
+        return OpenAICompatProvider(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
+            timeout=timeout,
+            extra_headers=headers,
+        )
+
+    if provider in ("ollama", "local"):
+        model = s.get("model") or s.get("model_name")
+        if not model:
+            raise HTTPException(status_code=400, detail="missing 'model' in provider settings")
+
+        base_url = s.get("base_url") or s.get("baseUrl") or s.get("host") or "http://localhost:11434"
+        return OllamaProvider(
+            model=model,
+            base_url=base_url,
+            temperature=temperature,
+            timeout=int(s.get("timeout") or 120),
+            extra_headers=headers,
+        )
+
+    raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'")
 
 def _clone_catalog_structure(src: polib.POFile) -> polib.POFile:
     dst = polib.POFile()
@@ -411,23 +526,56 @@ async def analyze(po: UploadFile = File(...)):
 # Translation core + batching with automatic retries and anti-echo
 # -----------------------------------------------------------------------------
 def _build_items_for_locale(
-    catalog: polib.POFile, target_locale: str
+    catalog: polib.POFile,
+    target_locale: str,
 ) -> Tuple[List[dict], Dict[str, Tuple[int, Optional[int]]]]:
+    """
+    Build model input items for a given locale.
+
+    Returns:
+      items: [{"key": "idx|p0", "text": "...", "expected_placeholders": {...}, "context": "..."}, ...]
+      reverse: {"idx|p0": (entry_index, plural_form_index_or_None), ...}
+    """
     items: List[dict] = []
     reverse: Dict[str, Tuple[int, Optional[int]]] = {}
     npl = nplurals_for_locale(target_locale)
 
     for idx, e in enumerate(catalog):
-        expected = extract_all_placeholders_from_entry(e)
+        # Skip obsolete entries
+        if e.obsolete:
+            continue
+
+        # Plural entry
         if e.msgid_plural:
+            expected_sing = extract_all_placeholders(e.msgid or "")
+            expected_plur = extract_all_placeholders(e.msgid_plural or "")
+
             for f in range(npl):
                 src_text = e.msgid if f == 0 else (e.msgid_plural or e.msgid)
                 key = f"{idx}|p{f}"
-                items.append({"key": key, "text": src_text, "expected_placeholders": expected})
+                exp = expected_sing if f == 0 else expected_plur
+                items.append(
+                    {
+                        "key": key,
+                        "text": src_text,
+                        "expected_placeholders": exp,
+                        "context": e.msgctxt or "",
+                    }
+                )
                 reverse[key] = (idx, f)
+
+        # Singular entry
         else:
             key = f"{idx}"
-            items.append({"key": key, "text": e.msgid, "expected_placeholders": expected})
+            exp = extract_all_placeholders(e.msgid or "")
+            items.append(
+                {
+                    "key": key,
+                    "text": e.msgid or "",
+                    "expected_placeholders": exp,
+                    "context": e.msgctxt or "",
+                }
+            )
             reverse[key] = (idx, None)
 
     return items, reverse
@@ -435,158 +583,210 @@ def _build_items_for_locale(
 
 # Hardened retry logic with micro-batch last pass and review list (no blind echoes).
 async def _translate_items_with_retries(
-    provider,
-    all_items: List[dict],
+    *,
+    all_items: List[Dict[str, Any]],
+    provider,  # must expose async translate_batch(...)
     source_lang: str,
     target_locale: str,
     batch_size: int,
-    system_prompt: str,
-    glossary: str,
-    on_batch_progress: Optional[Callable[[int, int], Awaitable[None]]] = None,
-    on_batch_detail: Optional[Callable[[dict], Awaitable[None]]] = None,  # detail logger
+    system_prompt: Optional[str] = None,
+    glossary: Optional[str] = None,
+    http_session=None,
+    max_retries: int = 3,
+    on_batch_progress=None,   # async (newly:int, echoed:int) -> None
+    on_batch_detail=None,     # async (payload:dict) -> None
 ) -> Tuple[Dict[str, str], List[dict]]:
     """
-    Sends items in batches; retries missing/echoed-only items up to MAX_RETRIES.
-    On the final attempt:
-      - drop to micro-batches (size=1) for any stragglers
-      - accept echo-safe items (numbers/URLs/pure symbols or exact glossary terms)
-    Remaining items are returned for user review with reason = "echo" or "missing".
+    Robust translate with batching, retries, placeholder validation, and review output.
+
+    Returns:
+      (translated_map, review_items)
+      translated_map: { key: translated_text }
+      review_items: [ {key, source, candidate?, reason: "echo"|"missing"|"placeholder_error"} ]
     """
-    # Clamp to safe range
-    batch_size = max(10, min(300, int(batch_size or 40)))
 
-    remaining: Dict[str, dict] = {str(it["key"]): {"key": str(it["key"]), "text": it["text"]} for it in all_items}
+    def _chunks(seq: List[Any], n: int) -> List[List[Any]]:
+        n = max(1, int(n))
+        return [seq[i:i+n] for i in range(0, len(seq), n)]
+
+    def _review_item(reason: str, key: str, source: str, candidate: Optional[str] = None) -> dict:
+        item = {"key": str(key), "source": source, "reason": reason}
+        if candidate is not None:
+            item["candidate"] = candidate
+        return item
+
+    # Build remaining work map
+    remaining: Dict[str, Dict[str, Any]] = {
+        str(it["key"]): {
+            "key": str(it["key"]),
+            "text": str(it["text"]),
+            "expected": it.get("expected_placeholders"),
+            "context": it.get("context", ""),
+        }
+        for it in all_items
+    }
+
     translated: Dict[str, str] = {}
-    pending_echo: Dict[str, dict] = {}  # key -> {key, text}
+    pending_echo: Dict[str, Dict[str, Any]] = {}
+    review_items: List[dict] = []
 
-    def make_batches(values: Iterable[dict], size: int) -> List[List[dict]]:
-        data = list(values)
-        return [data[i : i + size] for i in range(0, len(data), size)]
+    if not remaining:
+        return {}, []
 
-    async def emit_detail(payload: dict):
-        if on_batch_detail:
-            try:
-                await on_batch_detail(payload)
-            except Exception:
-                pass  # never break work due to logging
-
-    # Normal retry passes
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, int(max_retries) + 1):
         if not remaining:
             break
 
-        batches = make_batches(list(remaining.values()), batch_size)
+        batches = _chunks(list(remaining.values()), batch_size)
         for b_index, batch in enumerate(batches, start=1):
+            # Construct provider batch, include context when present
+            provider_batch = []
+            for it in batch:
+                pb = {"key": it["key"], "text": it["text"]}
+                if it.get("context"):
+                    pb["context"] = it["context"]
+                provider_batch.append(pb)
+
             try:
-                result = await provider.translate_batch(
-                    batch=batch,
+                result_map = await provider.translate_batch(
+                    batch=provider_batch,
                     source_lang=source_lang,
                     target_locale=target_locale,
-                    system_prompt=system_prompt,
                     glossary=glossary,
+                    system_prompt=system_prompt,
+                    http_session=http_session,
                 )
             except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Provider error: {e}")
+                if on_batch_detail:
+                    await on_batch_detail(
+                        {
+                            "type": "batch_error",
+                            "attempt": attempt,
+                            "batch_index": b_index,
+                            "batch_size": len(batch),
+                            "error": str(e)[:200],
+                        }
+                    )
+                continue
 
-            if not isinstance(result, dict):
-                raise HTTPException(status_code=400, detail="Provider error: invalid batch result")
+            if not isinstance(result_map, dict):
+                if on_batch_detail:
+                    await on_batch_detail(
+                        {
+                            "type": "batch_error",
+                            "attempt": attempt,
+                            "batch_index": b_index,
+                            "batch_size": len(batch),
+                            "error": "invalid batch result shape",
+                        }
+                    )
+                continue
 
             newly, echoed = 0, 0
-            missing_keys: List[str] = []
-            # Evaluate every item in the original batch to catch omitted keys
             for item in batch:
                 k = str(item["key"])
-                v = result.get(k)
-                if v is None:
-                    missing_keys.append(k)
-                    continue
+                v = result_map.get(k)
                 src_text = item["text"]
-                v = str(v)
+
+                if v is None:
+                    # model omitted this key
+                    continue
+
+                v = "" if v is None else str(v)
+
+                # If model echoed source, only accept when allowlisted
                 if v == src_text and not _allow_echo(src_text, glossary):
                     echoed += 1
                     pending_echo[k] = {"key": k, "text": src_text}
                     continue
+
+                # Validate placeholders for this item
+                try:
+                    validate_translation_placeholders(item.get("expected") or {}, v)
+                except ValueError as ve:
+                    # Record placeholder error for review
+                    review_items.append(_review_item("placeholder_error", k, src_text, candidate=v))
+                    if on_batch_detail:
+                        await on_batch_detail(
+                            {
+                                "type": "placeholder_error",
+                                "attempt": attempt,
+                                "key": k,
+                                "error": str(ve),
+                                "sample_src": src_text[:120],
+                                "sample_out": v[:120],
+                            }
+                        )
+                    continue
+
+                # Accept translation
                 translated[k] = v
+                newly += 1
+                pending_echo.pop(k, None)
                 if k in remaining:
                     del remaining[k]
-                if k in pending_echo:
-                    pending_echo.pop(k, None)
-                newly += 1
 
-            if on_batch_progress and (newly > 0 or echoed > 0):
+            if on_batch_detail:
+                await on_batch_detail(
+                    {
+                        "type": "batch_result",
+                        "attempt": attempt,
+                        "batch_index": b_index,
+                        "batch_size": len(batch),
+                        "returned": len(result_map),
+                        "accepted": newly,
+                        "echoed": echoed,
+                        "missing_count": len([it for it in batch if str(it["key"]) in remaining]),
+                    }
+                )
+            if on_batch_progress:
                 await on_batch_progress(newly, echoed)
 
-            await emit_detail({
-                "type": "batch",
-                "attempt": attempt,
-                "batch_index": b_index,
-                "batch_size": len(batch),
-                "returned": len(result),
-                "accepted": newly,
-                "echoed": echoed,
-                "missing_sample": missing_keys[:5],
-                "missing_count": len(missing_keys),
-            })
-
-    # Last-chance micro-batch pass for any stragglers (helps local models that drop keys)
+    # Final micro-batch pass for anything still remaining
     if remaining:
-        for k in list(remaining.keys()):
-            item = remaining[k]
+        for k, item in list(remaining.items()):
             try:
-                result = await provider.translate_batch(
-                    batch=[item],
+                result_map = await provider.translate_batch(
+                    batch=[{"key": item["key"], "text": item["text"], **({"context": item["context"]} if item.get("context") else {})}],
                     source_lang=source_lang,
                     target_locale=target_locale,
-                    system_prompt=system_prompt,
                     glossary=glossary,
+                    system_prompt=system_prompt,
+                    http_session=http_session,
                 )
-            except Exception:
-                await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "provider_error"})
-                continue
+                v = result_map.get(str(item["key"]))
+                if v is None:
+                    # still missing
+                    review_items.append(_review_item("missing", k, item["text"]))
+                    continue
 
-            v = (result or {}).get(k)
-            if v is not None:
-                src_text = item["text"]
                 v = str(v)
-                if v == src_text and not _allow_echo(src_text, glossary):
-                    await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "echo_rejected"})
-                    pending_echo[k] = {"key": k, "text": src_text}
-                else:
-                    translated[k] = v
-                    del remaining[k]
-                    if k in pending_echo:
-                        pending_echo.pop(k, None)
-                    if on_batch_progress:
-                        await on_batch_progress(1, 0)
-                    await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "accepted"})
-            else:
-                await emit_detail({"type": "retry", "mode": "micro", "key": k, "status": "missing_return"})
+                if v == item["text"] and not _allow_echo(item["text"], glossary):
+                    # echo needs review
+                    pending_echo[k] = {"key": k, "text": item["text"]}
+                    continue
 
-    # Echo-safe fallback (numbers/URLs/symbols/etc.) — auto-accept
-    if remaining:
-        autofilled = 0
-        for k in list(remaining.keys()):
-            src_text = remaining[k]["text"]
-            if _allow_echo(src_text, glossary):
-                translated[k] = src_text
+                validate_translation_placeholders(item.get("expected") or {}, v)
+                translated[str(item["key"])] = v
                 del remaining[k]
-                pending_echo.pop(k, None)
-                autofilled += 1
-        if autofilled and on_batch_progress:
-            await on_batch_progress(autofilled, 0)
-        if autofilled:
-            await emit_detail({"type": "fallback", "mode": "echo_safe", "autofilled": autofilled})
+                if on_batch_progress:
+                    await on_batch_progress(1, 0)
+            except Exception as e:
+                review_items.append(_review_item("missing", k, item["text"]))
+                if on_batch_detail:
+                    await on_batch_detail(
+                        {"type": "micro_error", "key": k, "error": str(e)[:200], "sample_src": item["text"][:120]}
+                    )
 
-    # Build review list for anything unresolved
-    review: List[dict] = []
-    for k in list(remaining.keys()):
-        review.append({"key": k, "source": remaining[k]["text"], "candidate": None, "reason": "missing"})
-        del remaining[k]
+    # Any unresolved echoes are added to review with the echoed source as candidate
+    for k, item in pending_echo.items():
+        review_items.append(_review_item("echo", k, item["text"], candidate=item["text"]))
 
-    for k, item in list(pending_echo.items()):
-        review.append({"key": k, "source": item["text"], "candidate": item["text"], "reason": "echo"})
+    # Any residual remaining are considered missing
+    for k, item in remaining.items():
+        review_items.append(_review_item("missing", k, item["text"]))
 
-    return translated, review
+    return translated, review_items
 
 
 def _fill_catalog_from_map(

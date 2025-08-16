@@ -1,170 +1,190 @@
+# backend/app/providers/ollama.py
 from __future__ import annotations
+
 import json
+import re
 from typing import Any, Dict, List, Optional
 
-import httpx
+import aiohttp
 
-# Optional debug recorder used by /debug/provider/recent
-try:
-    from app.utils.debug_buffer import record as dbg_record
-except Exception:  # pragma: no cover
-    def dbg_record(*args, **kwargs):  # type: ignore
+
+def _extract_json_safely(text: Any) -> Dict[str, Any]:
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        raise ValueError("Provider returned non-string content")
+
+    s = text.strip()
+
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        candidate = fence.group(1)
+        return json.loads(candidate)
+
+    try:
+        return json.loads(s)
+    except Exception:
         pass
 
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        candidate = s[first : last + 1]
+        return json.loads(candidate)
 
-def _extract_json_object(content: str) -> dict:
-    if not isinstance(content, str):
-        raise ValueError("Provider content is not a string")
-    start = content.find("{")
-    end = content.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found in provider content")
-    return json.loads(content[start : end + 1])
+    raise ValueError(f"Provider returned non-JSON. Content snippet: {s[:240]}")
+
+
+def _items_list_to_kv(d: Dict[str, Any]) -> Dict[str, str]:
+    if isinstance(d, dict) and "items" in d and isinstance(d["items"], list):
+        out: Dict[str, str] = {}
+        for it in d["items"]:
+            if not isinstance(it, dict):
+                continue
+            k = str(it.get("key", "")).strip()
+            v = it.get("text", "")
+            if k:
+                out[k] = "" if v is None else str(v)
+        return out
+
+    if isinstance(d, dict):
+        out: Dict[str, str] = {}
+        for k, v in d.items():
+            if isinstance(v, (str, int, float)):
+                out[str(k)] = str(v)
+        if out:
+            return out
+
+    return {}
 
 
 class OllamaProvider:
     """
-    Back-compatible constructor:
-
-      A) OllamaProvider(settings_obj)
-      B) OllamaProvider(host, model, temperature=0.2, timeout_seconds=900)
+    Ollama chat provider (local).
+    Defaults to http://localhost:11434 but can be pointed elsewhere.
+    Expects STRICT JSON output identical to OpenAICompatProvider.
     """
 
     def __init__(
         self,
-        host_or_settings: Any,
-        model: Optional[str] = None,
+        *,
+        model: str,
+        base_url: str = "http://localhost:11434",
         temperature: float = 0.2,
-        timeout_seconds: int = 900,
-    ):
-        if model is None and not isinstance(host_or_settings, str):
-            s = host_or_settings
-            oc = getattr(s, "ollama", None)
-            if oc is None:
-                raise ValueError("Settings object missing 'ollama'")
-            def get(obj, key, default=None):
-                return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
-            host = get(oc, "host") or "http://localhost:11434"
-            model = get(oc, "model") or "llama3"
-            temperature = float(get(oc, "temperature", temperature))
-        else:
-            host = host_or_settings or "http://localhost:11434"
-
-        self.host = str(host).rstrip("/")
-        self.model = str(model)
+        timeout: int = 120,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
         self.temperature = float(temperature)
-
-        self.timeout = httpx.Timeout(
-            timeout=None,
-            connect=30.0,
-            read=float(timeout_seconds),
-            write=120.0,
-            pool=120.0,
-        )
+        self.timeout = int(timeout)
+        self.extra_headers = extra_headers or {}
 
     async def translate_batch(
         self,
-        batch: List[dict],
+        *,
+        batch: List[Dict[str, Any]],
         source_lang: str,
         target_locale: str,
-        system_prompt: str,
-        glossary: str,
+        system_prompt: Optional[str] = None,
+        glossary: Optional[str] = None,
+        http_session: Optional[aiohttp.ClientSession] = None,
     ) -> Dict[str, str]:
-        if len(batch) > 300:
-            raise ValueError("Batch too large (>300)")
+        expected_keys = [str(it["key"]) for it in batch]
 
-        expected_keys: List[str] = [str(it["key"]) for it in batch]
-        payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
+        items = []
+        for it in batch:
+            item = {"key": str(it["key"]), "text": str(it["text"])}
+            if it.get("context"):
+                item["context"] = str(it["context"])
+            items.append(item)
+
         rules = (
             "Return STRICT JSON only. Do not add commentary. "
             "Return an object with one field: items. "
             "items is an array with EXACTLY the same number of elements as you received. "
-            "Each element is {key,text}. Use the SAME key values you received. "
-            "Return items in the SAME ORDER as input. Preserve placeholders and HTML tags."
+            "Each element is an object with fields key and text. "
+            "Use the SAME key values you received. "
+            "Return items in the SAME ORDER as input. "
+            "Preserve placeholders like %s, %d, %1$s, {name}, and keep HTML tags unchanged. "
+            "Do NOT add or remove placeholders. "
+            "If an input item has a 'context' field, use it for disambiguation, but do NOT include it in the output."
         )
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt or "You translate WordPress strings. " + rules},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "instructions": rules,
-                            "source_lang": source_lang,
-                            "target_locale": target_locale,
-                            "glossary": glossary or "",
-                            "items": payload_items,
-                            "keys": expected_keys,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            "options": {"temperature": self.temperature},
-            "stream": False,
+
+        user_payload = {
+            "instructions": rules,
+            "source_lang": source_lang,
+            "target_locale": target_locale,
+            "glossary": glossary or "",
+            "items": items,
+            "keys": expected_keys,
         }
 
-        url = f"{self.host}/api/chat"
-        dbg_record({"provider": "ollama", "dir": "request", "n": len(payload_items), "model": self.model})
+        headers = {"Content-Type": "application/json"}
+        if self.extra_headers:
+            headers.update(self.extra_headers)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        # Ollama chat endpoint
+        url = f"{self.base_url}/api/chat"
+        body = {
+            "model": self.model,
+            "stream": False,
+            "options": {"temperature": self.temperature},
+            "messages": [
+                {"role": "system", "content": system_prompt or "You translate WordPress strings accurately."},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        }
+
+        close_session = False
+        if http_session is None:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            http_session = aiohttp.ClientSession(timeout=timeout)
+            close_session = True
+
+        try:
+            async with http_session.post(url, headers=headers, json=body) as resp:
+                payload_text = await resp.text()
+                if resp.status >= 400:
+                    raise ValueError(f"HTTP {resp.status}: {payload_text[:240]}")
+                try:
+                    data = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    # Some Ollama builds return raw content; normalize
+                    data = {"message": {"content": payload_text}}
+        finally:
+            if close_session:
+                await http_session.close()
+
+        # Extract assistant content from Ollama
+        content = ""
+        if isinstance(data, dict):
+            # Newer Ollama chat API:
+            #   {"message":{"role":"assistant","content":"..."}, "done": true}
+            if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
+                content = data["message"]["content"]
+            # Older generate API compatibility:
+            elif "response" in data and isinstance(data["response"], str):
+                content = data["response"]
+            else:
+                content = json.dumps(data)
+        else:
+            content = str(data)
+
+        parsed = _extract_json_safely(content)
+        mapping = _items_list_to_kv(parsed)
+
+        if not mapping:
+            # last-chance parser
             try:
-                r = await client.post(url, json=body)
-            except httpx.ReadTimeout as e:
-                raise ValueError(f"Ollama read timeout: {e}") from e
-            except httpx.ConnectError as e:
-                raise ValueError(f"Ollama connect error: {e}") from e
-            except httpx.HTTPError as e:
-                raise ValueError(f"Ollama HTTP error: {e}") from e
+                maybe_map = json.loads(content)
+                if isinstance(maybe_map, dict):
+                    mapping = {str(k): str(v) for k, v in maybe_map.items() if isinstance(v, (str, int, float))}
+            except Exception:
+                pass
 
-        if r.status_code >= 400:
-            raise ValueError(f"Ollama HTTP {r.status_code}: {r.text[:500]}")
+        return mapping
 
-        data = r.json()
-        try:
-            content = data["message"]["content"]
-        except Exception as e:
-            raise ValueError(f"Ollama unexpected schema: {e}. Body snippet: {str(data)[:300]}") from e
-
-        dbg_record({"provider": "ollama", "dir": "response", "snippet": content[:200]})
-
-        try:
-            obj = _extract_json_object(content)
-        except Exception as e:
-            raise ValueError(f"Ollama returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}") from e
-
-        items = obj.get("items")
-        if not isinstance(items, list):
-            raise ValueError("JSON missing 'items' array")
-
-        # Build output with the same key-rescue strategy
-        out: Dict[str, str] = {}
-        returned_keys = [str(it.get("key")) for it in items if isinstance(it, dict)]
-        dbg_record({"provider": "ollama", "dir": "parsed", "count": len(items), "keys_sample": returned_keys[:5]})
-
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            k = it.get("key")
-            v = it.get("text")
-            if k is None or v is None:
-                continue
-            k = str(k)
-            if k in expected_keys:
-                out[k] = str(v)
-
-        if len(out) < len(items) and len(items) == len(expected_keys):
-            remapped = 0
-            for idx, it in enumerate(items):
-                v = it.get("text")
-                if v is None:
-                    continue
-                key_for_position = expected_keys[idx]
-                if key_for_position not in out:
-                    out[key_for_position] = str(v)
-                    remapped += 1
-            if remapped:
-                dbg_record({"provider": "ollama", "dir": "remap_by_position", "remapped": remapped})
-
-        return out
+# --- public aliases for external imports ---
+extract_json_safely = _extract_json_safely
+items_list_to_kv = _items_list_to_kv

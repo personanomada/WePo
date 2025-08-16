@@ -1,261 +1,248 @@
+# backend/app/providers/openai_compat.py
 from __future__ import annotations
+
 import json
+import re
 from typing import Any, Dict, List, Optional
 
-import httpx
+import aiohttp
 
-# Optional debug recorder used by /debug/provider/recent
-try:
-    from app.utils.debug_buffer import record as dbg_record
-except Exception:  # pragma: no cover
-    def dbg_record(*args, **kwargs):  # type: ignore
+
+def _extract_json_safely(text: Any) -> Dict[str, Any]:
+    """
+    Try to robustly extract a JSON object from model output.
+    Accepts:
+      - a Python dict already
+      - a pure JSON string
+      - markdown-fenced ```json ... ``` blocks
+      - strings with leading/trailing prose, where we take the largest {...} block
+    Raises ValueError if we cannot recover a valid JSON object.
+    """
+    if isinstance(text, dict):
+        return text
+
+    if not isinstance(text, str):
+        raise ValueError("Provider returned non-string content")
+
+    s = text.strip()
+
+    # 1) Look for fenced json code block
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        candidate = fence.group(1)
+        try:
+            return json.loads(candidate)
+        except Exception as e:
+            raise ValueError(f"Provider returned fenced non-JSON: {e}. Content snippet: {candidate[:240]}")
+
+    # 2) Try direct json
+    try:
+        return json.loads(s)
+    except Exception:
         pass
 
+    # 3) Try to grab the largest {...} span
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        candidate = s[first : last + 1]
+        try:
+            return json.loads(candidate)
+        except Exception as e:
+            raise ValueError(
+                f"Provider returned non-JSON or truncated JSON: {e}. "
+                f"Content snippet: {candidate[:240]}"
+            )
 
-def extract_json_safely(content: str) -> dict:
-    """
-    Find the outermost {...} in 'content' and parse it.
-    Raise ValueError if no single JSON object can be found.
-    """
-    if not isinstance(content, str):
-        raise ValueError("Provider content is not a string")
-    start = content.find("{")
-    end = content.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found in provider content")
-    return json.loads(content[start : end + 1])
+    # 4) Give up
+    raise ValueError(f"Provider returned non-JSON without any brace block. Content snippet: {s[:240]}")
 
 
-def _json_schema_for_keys(keys: List[str]) -> dict:
+def _items_list_to_kv(d: Dict[str, Any]) -> Dict[str, str]:
     """
-    JSON Schema to force:
-      - top-level object with 'items'
-      - items is an array with EXACTLY len(keys) elements
-      - each element is {key,text} where key ∈ keys
-      - unique keys
-    LM Studio accepts response_format.type = 'json_schema'.
+    Normalize a model response into {key: text}.
+
+    Acceptable shapes:
+      - {"items": [{"key": "...","text":"..."}, ...]}
+      - {"0":"...", "1":"..."}  not preferred, but we will accept
     """
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "wp_translation_items",
-            "schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["items"],
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "minItems": len(keys),
-                        "maxItems": len(keys),
-                        "uniqueItems": True,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": ["key", "text"],
-                            "properties": {
-                                "key": {"type": "string", "enum": keys},
-                                "text": {"type": "string"},
-                            },
-                        },
-                    }
-                },
-            },
-        },
-    }
+    if isinstance(d, dict) and "items" in d and isinstance(d["items"], list):
+        out: Dict[str, str] = {}
+        for it in d["items"]:
+            if not isinstance(it, dict):
+                continue
+            k = str(it.get("key", "")).strip()
+            v = it.get("text", "")
+            if k:
+                out[k] = "" if v is None else str(v)
+        return out
+
+    # fallback if model returns a raw map
+    if isinstance(d, dict):
+        out: Dict[str, str] = {}
+        for k, v in d.items():
+            if isinstance(v, (str, int, float)):
+                out[str(k)] = str(v)
+        if out:
+            return out
+
+    return {}
 
 
 class OpenAICompatProvider:
     """
-    Back-compatible constructor:
+    Generic OpenAI-compatible chat.completions provider.
+    Works with:
+      - OpenAI API
+      - OpenRouter OpenAI-compatible endpoint
+      - Other gateways that mirror /v1/chat/completions
 
-      A) OpenAICompatProvider(settings_obj)
-      B) OpenAICompatProvider(base_url, api_key, model, temperature=0.2, timeout_seconds=900)
+    Expected output is STRICT JSON:
+      {"items":[{"key":"<same as input>", "text":"<translated>"} ...]}
     """
 
     def __init__(
         self,
-        base_url_or_settings: Any,
+        *,
+        model: str,
         api_key: Optional[str] = None,
-        model: Optional[str] = None,
+        base_url: str = "https://api.openai.com/v1",
         temperature: float = 0.2,
-        timeout_seconds: int = 900,
-    ):
-        # Pattern A: settings object
-        if api_key is None and model is None and not isinstance(base_url_or_settings, str):
-            s = base_url_or_settings
-            oc = getattr(s, "openai_compat", None)
-            if oc is None:
-                raise ValueError("Settings object missing 'openai_compat'")
-            def get(obj, key, default=None):
-                return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
-            base_url = get(oc, "base_url")
-            api_key = get(oc, "api_key") or None
-            model = get(oc, "model")
-            temperature = float(get(oc, "temperature", temperature))
-        else:
-            # Pattern B: explicit args
-            base_url = base_url_or_settings
-
-        if not base_url:
-            raise ValueError("OpenAI-compatible base_url is required")
-        if not model:
-            raise ValueError("OpenAI-compatible model is required")
-
-        self.base_url = str(base_url).rstrip("/")
+        timeout: int = 60,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.model = model
         self.api_key = api_key
-        self.model = str(model)
+        self.base_url = base_url.rstrip("/")
         self.temperature = float(temperature)
-
-        # Generous timeouts to avoid "Client disconnected" on local servers
-        self.timeout = httpx.Timeout(
-            timeout=None,
-            connect=30.0,
-            read=float(timeout_seconds),
-            write=120.0,
-            pool=120.0,
-        )
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        self.headers = headers
+        self.timeout = int(timeout)
+        self.extra_headers = extra_headers or {}
 
     async def translate_batch(
         self,
-        batch: List[dict],
+        *,
+        batch: List[Dict[str, Any]],
         source_lang: str,
         target_locale: str,
-        system_prompt: str,
-        glossary: str,
+        system_prompt: Optional[str] = None,
+        glossary: Optional[str] = None,
+        http_session: Optional[aiohttp.ClientSession] = None,
     ) -> Dict[str, str]:
-        if len(batch) > 300:
-            raise ValueError("Batch too large (>300)")
+        """
+        Translate a batch of items.
 
-        # Stable keys for this batch (global indices or ctx|id)
-        expected_keys: List[str] = [str(it["key"]) for it in batch]
-        payload_items = [{"key": it["key"], "text": it["text"]} for it in batch]
+        batch = [
+          {"key":"0","text":"Settings","context":"noun"},
+          {"key":"1","text":"%1$s file","context":""},
+          ...
+        ]
+
+        Returns:
+          { "0": "Ajustes", "1": "%1$s archivo", ... }
+        """
+        expected_keys = [str(it["key"]) for it in batch]
+
+        payload_items = []
+        for it in batch:
+            item = {"key": str(it["key"]), "text": str(it["text"])}
+            if it.get("context"):
+                # Context included only in the input. The model must NOT echo it back.
+                item["context"] = str(it["context"])
+            payload_items.append(item)
 
         rules = (
             "Return STRICT JSON only. Do not add commentary. "
             "Return an object with one field: items. "
             "items is an array with EXACTLY the same number of elements as you received. "
-            "Each element is {key,text}. Use the SAME key values you received. "
-            "Preserve placeholders like %s, {name}, and HTML tags."
+            "Each element is an object with fields key and text. "
+            "Use the SAME key values you received. "
+            "Return items in the SAME ORDER as input. "
+            "Preserve placeholders like %s, %d, %1$s, {name}, and keep HTML tags unchanged. "
+            "Do NOT add or remove placeholders. "
+            "If an input item has a 'context' field, use it for disambiguation, but do NOT include it in the output."
         )
 
-        base_body = {
+        user_payload = {
+            "instructions": rules,
+            "source_lang": source_lang,
+            "target_locale": target_locale,
+            "glossary": glossary or "",
+            "items": payload_items,
+            "keys": expected_keys,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.extra_headers:
+            headers.update(self.extra_headers)
+
+        body = {
             "model": self.model,
             "temperature": self.temperature,
-            # many local servers accept max_tokens to allow long outputs
-            "max_tokens": 2048,
             "messages": [
-                {"role": "system", "content": system_prompt or "You translate WordPress strings. " + rules},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "instructions": rules + " Return items in the SAME ORDER as input.",
-                            "source_lang": source_lang,
-                            "target_locale": target_locale,
-                            "glossary": glossary or "",
-                            "items": payload_items,
-                            "keys": expected_keys,  # redundancy helps the model
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
+                {"role": "system", "content": system_prompt or "You translate WordPress strings accurately."},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
             ],
             "stream": False,
         }
 
         url = f"{self.base_url}/chat/completions"
-        dbg_record({"provider": "openai_compat", "dir": "request", "n": len(payload_items), "model": self.model})
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            # Try JSON Schema with exact keys
-            body = dict(base_body)
-            body["response_format"] = _json_schema_for_keys(expected_keys)
-            try:
-                r = await client.post(url, headers=self.headers, json=body)
-            except httpx.ReadTimeout as e:
-                raise ValueError(f"Read timeout contacting provider: {e}") from e
-            except httpx.ConnectError as e:
-                raise ValueError(f"Cannot connect to provider: {e}") from e
-            except httpx.HTTPError as e:
-                raise ValueError(f"HTTP error contacting provider: {e}") from e
+        # Manage session lifecycle correctly: close if we created it
+        close_session = False
+        if http_session is None:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            http_session = aiohttp.ClientSession(timeout=timeout)
+            close_session = True
 
-            # Fallback to text mode if the server rejects json_schema
-            if r.status_code == 400:
-                schema_err_snippet = r.text[:200]
-                r = await client.post(url, headers=self.headers, json=base_body)
-                if r.status_code >= 400:
-                    raise ValueError(
-                        f"Provider HTTP 400 with schema, then HTTP {r.status_code}: {r.text[:300]} | First error: {schema_err_snippet}"
-                    )
-
-        if r.status_code >= 400:
-            raise ValueError(f"Provider HTTP {r.status_code}: {r.text[:500]}")
-
-        data = r.json()
-        # Try multiple common shapes
-        content: Optional[str] = None
+        data: Dict[str, Any]
         try:
-            content = data["choices"][0]["message"]["content"]
+            async with http_session.post(url, headers=headers, json=body) as resp:
+                txt = await resp.text()
+                if resp.status >= 400:
+                    raise ValueError(f"HTTP {resp.status}: {txt[:240]}")
+                # Try parsing the full response as JSON first
+                try:
+                    data = json.loads(txt)
+                except json.JSONDecodeError:
+                    # Some servers return raw assistant content only
+                    data = {"choices": [{"message": {"content": txt}}]}
+        finally:
+            if close_session:
+                await http_session.close()
+
+        # Extract assistant content
+        content = ""
+        try:
+            if isinstance(data, dict) and "choices" in data and data["choices"]:
+                # OpenAI style
+                content = data["choices"][0]["message"]["content"]
+            elif isinstance(data, dict) and "output_text" in data:
+                # Some proxies return a flat output_text
+                content = data["output_text"]
+            else:
+                # Fallback to entire payload as content
+                content = json.dumps(data)
         except Exception:
-            content = data.get("choices", [{}])[0].get("text") or data.get("response")
+            content = json.dumps(data)
 
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError(f"Unexpected provider schema or empty content. Body snippet: {str(data)[:300]}")
+        # Parse JSON from content
+        parsed = _extract_json_safely(content)
+        mapping = _items_list_to_kv(parsed)
 
-        dbg_record({"provider": "openai_compat", "dir": "response", "snippet": content[:200]})
+        # As a last resort, if mapping is empty try parse content as {"key":"text",...}
+        if not mapping:
+            try:
+                maybe_map = json.loads(content)
+                if isinstance(maybe_map, dict):
+                    mapping = {str(k): str(v) for k, v in maybe_map.items() if isinstance(v, (str, int, float))}
+            except Exception:
+                pass
 
-        # Parse JSON; unwrap {"response":"..."} if necessary
-        try:
-            obj = extract_json_safely(content)
-            unwrap_guard = 0
-            while "items" not in obj and isinstance(obj.get("response"), str) and unwrap_guard < 2:
-                obj = extract_json_safely(obj["response"])
-                unwrap_guard += 1
-        except Exception as e:
-            raise ValueError(f"Provider returned non-JSON or truncated JSON: {e}. Content snippet: {content[:200]}") from e
+        return mapping
 
-        items = obj.get("items")
-        if not isinstance(items, list):
-            raise ValueError("JSON missing 'items' array")
 
-        # Build output map with two fallbacks:
-        #  1) prefer exact keys as returned (if they match expected_keys)
-        #  2) if keys are wrong but lengths match, remap by position
-        out: Dict[str, str] = {}
-
-        returned_keys = [str(it.get("key")) for it in items if isinstance(it, dict)]
-        dbg_record({"provider": "openai_compat", "dir": "parsed", "count": len(items), "keys_sample": returned_keys[:5]})
-
-        # Case A: accept any correctly keyed subset
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            k = it.get("key")
-            v = it.get("text")
-            if k is None or v is None:
-                continue
-            k = str(k)
-            if k in expected_keys:
-                out[k] = str(v)
-
-        # Case B: lengths match but keys are wrong or repeated -> remap by position
-        if len(out) < len(items) and len(items) == len(expected_keys):
-            remapped = 0
-            for idx, it in enumerate(items):
-                v = it.get("text")
-                if v is None:
-                    continue
-                key_for_position = expected_keys[idx]
-                if key_for_position not in out:
-                    out[key_for_position] = str(v)
-                    remapped += 1
-            if remapped:
-                dbg_record({"provider": "openai_compat", "dir": "remap_by_position", "remapped": remapped})
-
-        return out
+# --- public aliases for external imports (keep at bottom of file) ---
+extract_json_safely = _extract_json_safely
+items_list_to_kv = _items_list_to_kv
